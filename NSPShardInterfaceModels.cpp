@@ -232,16 +232,20 @@ struct ToTensorShardingModel
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
-    (void)operandShardings;
-
     // Expect 1 operand and 1 result.
     if (op->getNumOperands() != 1 || op->getNumResults() != 1)
       return failure();
 
-    // "Accept-any": if the caller already provides a result sharding, accept it.
-    // Otherwise, we can't infer anything at this boundary.
+    // Prefer a caller-provided result sharding.
     if (resultShardings.size() >= 1 && resultShardings[0])
       return makeValueShardingOption(resultShardings[0]);
+
+    // Fallback: if the boundary carries operand sharding information (e.g. the
+    // memref was derived from a previously-sharded tensor), preserve it.
+    // This avoids losing sharding across memref<->tensor conversions in some
+    // pipelines.
+    if (operandShardings.size() >= 1 && operandShardings[0])
+      return makeValueShardingOption(operandShardings[0]);
 
     return shard::ShardingOption::makeEmpty();
   }
