@@ -233,40 +233,69 @@ private:
     return false;
   }
 
-  /// Attach `shard.shard` annotations to the operands/results of `op`.
+  /// Annotate a linalg::GenericOp with shard semantics.
   ///
-  /// This keeps the computation semantically identical, but makes sharding
-  /// explicit in the IR for downstream passes.
+  /// This function materializes sharding information for each tensor operand
+  /// (inputs and outputs) of a linalg::GenericOp by:
+  ///
+  ///  1. Creating explicit `!shard.sharding` SSA values describing how each
+  ///     tensor is partitioned across a shard grid.
+  ///  2. Wrapping tensor operands with `shard.shard` ops that attach those
+  ///     sharding descriptors to the SSA values.
+  ///  3. Rebuilding the linalg::GenericOp so that it consumes the annotated
+  ///     operands, since sharding is represented as SSA values rather than
+  ///     attributes.
+  ///
+  /// This function is invoked once per linalg::GenericOp selected by the
+  /// NSP shard planner, after a sharding plan has been computed (i.e. a loop
+  /// iterator to shard has already been chosen).
+  ///
+  /// Sharding decisions are conservative and operand-local:
+  ///  - A tensor dimension is sharded iff it is indexed directly by the
+  ///    loop iterator selected for sharding.
+  ///  - All other dimensions are replicated.
+  ///  - The current implementation assumes a 1-D shard grid (axis 0).
+  ///  - Halo sizes and offsets are not inferred here.
+  ///
+  /// The original linalg::GenericOp is replaced by a new one that consumes
+  /// the sharded operands; the region body is moved without cloning.
+  ///
+  /// \returns The newly created linalg::GenericOp consuming sharded operands.
   static linalg::GenericOp annotateGenericWithShard(linalg::GenericOp op,
                                                    shard::GridOp grid,
                                                    const ShardPlan &plan) {
+    // ------------------------------------------------------------------
+    // Obs. on Shard dialect (based on ODS from LLVM commit: 064f02dac):
+    //   %sh = shard.sharding @nsp split_axes = [...] : !shard.sharding
+    //   %v2 = shard.shard %v to %sh annotate_for_users : tensor<...>
+    //
+    // The key point is: the "sharding description" is a Value
+    // (!shard.sharding). Therefore, we must build shard.sharding first,
+    // and then use it as the second operand to shard.shard.
+    // ------------------------------------------------------------------
+
     OpBuilder b(op);
     Location loc = op.getLoc();
     MLIRContext *ctx = op.getContext();
 
-    // ------------------------------------------------------------------
-    // Shard dialect refresher (based on our ODS):
-    //
-    //   %sh = shard.sharding @nsp split_axes = [...] : !shard.sharding
-    //   %v2 = shard.shard %v to %sh annotate_for_users : tensor<...>
-    //
-    // The key point is: the "sharding description" is a VALUE (!shard.sharding),
-    // not an Attribute. Therefore, we must build shard.sharding first, and then
-    // use it as the second operand to shard.shard.
-    // ------------------------------------------------------------------
-
-    // Helper: build split_axes for one operand, derived from:
-    //   * the operand indexing_map
-    //   * the selected loop iterator (plan.shardIter)
-    //
-    // split_axes is an array with one entry per tensor dimension.
-    // Each entry is a list of grid axes (we use axis=0 for 1-D NSP grid):
-    //   - []   => replicated dimension
-    //   - [0]  => sharded along grid axis 0
-    //
-    // Heuristic used here:
-    //   If operand map result for tensor dim 'd' is exactly 'd(plan.shardIter)',
-    //   we consider that tensor dim eligible for sharding.
+    /// Build the `split_axes` specification for a single tensor operand.
+    ///
+    /// Given the operand's indexing map and ranked tensor type, this helper
+    /// determines which tensor dimensions are sharded versus replicated.
+    ///
+    /// For each tensor dimension `d`, the dimension is marked as sharded if:
+    ///   - The indexing map result for `d` is an AffineDimExpr, and
+    ///   - That dimension expression refers exactly to `plan.shardIter`.
+    ///
+    /// In other words, a tensor dimension is sharded iff it is indexed
+    /// directly by the loop iterator selected for sharding.
+    ///
+    /// The result is an ArrayAttr of length equal to the tensor rank, where:
+    ///   - An empty GridAxesAttr (`[]`) denotes replication.
+    ///   - A GridAxesAttr containing `[0]` denotes sharding along grid axis 0.
+    ///
+    /// Even if all dimensions are replicated, an explicit rank-sized array
+    /// is returned.
     auto buildSplitAxesForOperand = [&](AffineMap map,
                                         RankedTensorType rtt) -> ArrayAttr {
       SmallVector<Attribute> perDimAxes;
@@ -300,7 +329,24 @@ private:
       return ArrayAttr::get(ctx, perDimAxes);
     };
 
-    // Helper: create a !shard.sharding value for a given operand.
+    /// Materialize a `!shard.sharding` SSA value for a tensor operand.
+    ///
+    /// This helper constructs an explicit sharding descriptor as a value,
+    /// which can later be consumed by `shard.shard` ops and propagated through
+    /// use-def chains.
+    ///
+    /// Behavior:
+    ///  - If the operand is not a RankedTensorType, no sharding is created and
+    ///    an empty Value is returned.
+    ///  - Otherwise, the operand's indexing map is analyzed to compute
+    ///    `split_axes` via `buildSplitAxesForOperand`.
+    ///  - A `shard::ShardingOp` is created referencing the provided grid symbol.
+    ///
+    /// Halo sizes and per-dimension offsets are intentionally left empty;
+    /// they are not inferred at this stage of planning.
+    ///
+    /// \returns A Value of type `!shard.sharding`, or an empty Value if the
+    ///          operand cannot be sharded.
     auto buildShardingValueFor = [&](AffineMap map, Value tensorVal) -> Value {
       auto rtt = dyn_cast<RankedTensorType>(tensorVal.getType());
       if (!rtt)
@@ -323,6 +369,10 @@ private:
 
       return shardingOp.getResult(); // !shard.sharding
     };
+
+    // -------------------------------------------------------------------
+    // Main body
+    // -------------------------------------------------------------------
 
     // Indexing maps are ordered as: inputs..., outputs...
     auto maps = op.getIndexingMapsArray();
@@ -371,14 +421,12 @@ private:
       newOutputs.push_back(shardOp.getResult());
     }
 
-    // ------------------------------------------------------------------
-    // Rebuild the linalg.generic with the annotated operands.
+    // Rebuild the linalg::GenericOp so that it consumes the sharded SSA values.
     //
-    // Rationale:
-    //   shard.shard produces new SSA values. To ensure the computation consumes
-    //   them, we must create a new linalg.generic with (newInputs/newOutputs),
-    //   then move the region and replace the old op.
-    // ------------------------------------------------------------------
+    // Since sharding is represented as SSA data, simply inserting shard.shard
+    // ops is insufficient. To ensure the computation consumes them, we must
+    // create a new linalg.generic with (newInputs/newOutputs), then move the
+    // region and replace the old op.
     b.setInsertionPoint(op);
 
     SmallVector<AffineMap> indexingMaps(op.getIndexingMapsArray());
