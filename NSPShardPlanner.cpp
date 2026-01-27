@@ -59,14 +59,31 @@ struct ShardPlan {
   int64_t gridAxis = 0;
 };
 
-/// Pass that attaches shard annotations to linalg.generic operations.
+/// Planner pass that attaches explicit shard annotations to linalg.generic ops.
 ///
-/// This pass does NOT perform SPMDization itself; it only generates a
-/// declarative sharding IR. Downstream passes are expected to run:
-///   * -sharding-propagation (optional but recommended)
-///   * an SPMDization/materialization pass that lowers shard to slices and/or comms
+/// This pass analyzes linalg::GenericOp operations and materializes a
+/// declarative sharding plan using the shard dialect. The result is an IR
+/// where tensor operands are annotated with explicit `!shard.sharding` values
+/// and wrapped by `shard.shard` ops, describing how data is partitioned across
+/// a logical shard grid.
 ///
-/// See the shard dialect documentation. :contentReference[oaicite:2]{index=2}
+/// The pass is intentionally non-transformational:
+///  - It does NOT perform SPMDization;
+///  - It does NOT rewrite computation into per-shard kernels;
+///  - It does NOT lower to slices, subviews, or buffer-level operations.
+///
+/// Instead, this pass produces a first-class, SSA-based sharding IR that can
+/// be reasoned about, propagated, and refined by downstream passes.
+///
+/// Sharding decisions made by this pass are conservative and operand-local:
+///  - A tensor dimension is sharded only if it is indexed directly by a
+///    selected loop iterator.
+///  - All other dimensions are treated as replicated.
+///  - The current implementation assumes a 1-D shard grid.
+///
+/// This separation of concerns keeps planning, propagation, and lowering
+/// orthogonal, enabling multiple SPMDization strategies to consume the same
+/// declarative sharding IR.
 struct NSPShardPlannerPass
     : public PassWrapper<NSPShardPlannerPass, OperationPass<func::FuncOp>> {
 
