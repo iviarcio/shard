@@ -1,9 +1,16 @@
-//===- NSPShardInterfaceModels.cpp -------------------------------*- C++ -*-===//
+//===- NSPShardInterface.cpp - NSP Shard Interfcae Models -----------------===//
+//
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause.
+// For more license information:
+//   https://github.com/qualcomm/hexagon-mlir/LICENSE.txt
+//
+//===----------------------------------------------------------------------===//
 //
 // Register shard::ShardingInterface external models for a small set of
 // "boundary/view/sink" operations that appear in the NSP pipeline.
 //
-// Ops covered:
+// Ops covered so far:
 //   * memref.reinterpret_cast
 //   * bufferization.to_tensor
 //   * bufferization.materialize_in_destination
@@ -14,8 +21,8 @@
 // implement it, propagation can stop at that boundary. These ops are common
 // around bufferization boundaries and view-like transformations.
 //
-// Design (conservative)
-// ---------------------
+// Design
+// ------
 // * memref.reinterpret_cast:
 //     View-only. If we are given a sharding for the source, propagate it.
 //     Otherwise, return "empty" (cannot infer).
@@ -139,14 +146,13 @@ struct ReinterpretCastShardingModel
   getLoopIteratorTypes(Operation *) const {
     return {};
   }
-
   SmallVector<shard::ReductionKind>
   getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const { return {}; }
-
+  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
+    return {};
+  }
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
@@ -155,7 +161,6 @@ struct ReinterpretCastShardingModel
     // Expect 1 operand and 1 result.
     if (op->getNumOperands() != 1 || op->getNumResults() != 1)
       return failure();
-
     // Pass-through only if a sharding is provided for the operand.
     if (operandShardings.size() < 1 || !operandShardings[0])
       return shard::ShardingOption::makeEmpty();
@@ -170,8 +175,6 @@ struct ReinterpretCastShardingModel
     // Still, we expose inferred shardings to keep propagation consistent.
     auto srcTy = dyn_cast<MemRefType>(op->getOperand(0).getType());
     auto dstTy = dyn_cast<MemRefType>(op->getResult(0).getType());
-    (void)srcTy;
-    (void)dstTy;
 
     // For view-only ops, interpret shardingArray as dim-wise split axes of the
     // "logical tensor" shape (if any). If rank is unknown, just return grid-only.
@@ -221,14 +224,13 @@ struct ToTensorShardingModel
   getLoopIteratorTypes(Operation *) const {
     return {};
   }
-
   SmallVector<shard::ReductionKind>
   getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const { return {}; }
-
+  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
+    return {};
+  }
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
@@ -299,21 +301,19 @@ struct MaterializeInDestShardingModel
   getLoopIteratorTypes(Operation *) const {
     return {};
   }
-
   SmallVector<shard::ReductionKind>
   getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const { return {}; }
-
+  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
+    return {};
+  }
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
     (void)resultShardings;
 
-    // No results; we only care about the sharding of the tensor operand (usually
-    // operand 0).
+    // No results; we only care about the sharding of the tensor operand (usually operand 0).
     if (op->getNumOperands() < 1)
       return failure();
 

@@ -1,4 +1,11 @@
-//===- NSPPasses.cpp -----------------------------------------------------===//
+//===- NSPPasses.cpp - Sharding and SPMDization Passes in MLIR ------------===//
+//
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause.
+// For more license information:
+//   https://github.com/qualcomm/hexagon-mlir/LICENSE.txt
+//
+//===----------------------------------------------------------------------===//
 //
 // Registration glue for the NSP "shard -> SPMD" pipeline.
 //
@@ -14,16 +21,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
+#include "mlir/Pass/Pass.h"
 
 // Useful common transforms.
 #include "mlir/Transforms/Passes.h"        // canonicalizer, cse
 
-// #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
-
-// Shard dialect transforms.
+// shard dialect IR (GridOp, ShardOp, collectives, attrs).
 #include "mlir/Dialect/Shard/Transforms/Passes.h"
+#include "mlir/Dialect/Shard/IR/ShardOps.h"
 
 // NSP pieces.
 namespace mlir {
@@ -68,49 +76,42 @@ struct NSPShardPipelineOptions
       llvm::cl::init(true)};
 };
 
-/// Build the canonical NSP shard pipeline.
-///
-/// High-level intent:
-///   1) Planner: attach shard annotations (device mesh + tensor layout).
-///   2) Propagation: infer missing shardings using ShardingInterface.
-///   3) SPMDization: lower shard IR to explicit slices + collectives.
-///   4) Cleanup: canonicalize/CSE.
+/// Build the canonical NSP shard pipeline. At high-level:
+///  1. Planner: attach shard annotations (device mesh + tensor layout).
+///  2. Propagation: infer missing shardings using ShardingInterface.
+///  3. SPMDization: lower shard IR to explicit slices + collectives.
+///  4. Cleanup: canonicalize/CSE.
 static void buildNSPShardPipeline(OpPassManager &pm,
                                   const NSPShardPipelineOptions &opts) {
 
-  // 1) Planner (your NSPShardPlannerPass in NSPShardPlanner.cpp)
-  //
+  // 1. Planner (NSPShardPlannerPass in NSPShardPlanner.cpp)
   // To Planner options (nsp-count / allow-collectives) reach the
   // pass, it exposes as pass options and plumb here.
   pm.addPass(createNSPShardPlannerPass());
-
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
   }
 
-  // 2) Sharding propagation (Shard dialect pass)
-  //
+  // 2. Sharding propagation (Shard dialect pass)
   // This pass relies on shard::ShardingInterface models for ops in the graph.
   // Our NSPShardInterfaceModels.cpp attaches missing models.
   if (opts.runPropagation) {
     pm.addPass(shard::createShardingPropagationPass());
   }
-
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
   }
 
-  // 3) SPMDization / materialization
-  //
+  // 3. SPMDization / materialization
   // This pass is expected to:
   //   - compute per-NSP tensor slices (extract_slice/subview),
   //   - materialize collectives (all-reduce/all-gather/all-to-all),
   //   - rewrite compute ops to operate on local tiles.
   pm.addPass(createNSPSpmdizePass());
 
-  // 4) Cleanup
+  // 4. Cleanup
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -146,15 +147,12 @@ void registerNSPPipelines() {
 }
 
 /// Register dialect extensions required by NSP sharding propagation.
-///
-/// We need to call this during tool/driver setup *before* construct the MLIRContext
-/// and load dialects, e.g.:
-///   DialectRegistry registry;
-///   registerAllDialects(registry);
-///   registerNSPDialectExtensions(registry);
-///   MLIRContext ctx(registry);
 void registerNSPDialectExtensions(DialectRegistry &registry) {
-  // Attach shard::ShardingInterface external models for memref/bufferization ops.
+  registry.insert<mlir::func::FuncDialect,
+                  mlir::memref::MemRefDialect,
+                  mlir::bufferization::BufferizationDialect,
+                  mlir::shard::ShardDialect>();
+
   registerNSPShardInterfaceModels(registry);
 }
 
