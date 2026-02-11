@@ -35,6 +35,7 @@
 // shard dialect IR (GridOp, ShardOp, collectives, attrs).
 #include "mlir/Dialect/Shard/Transforms/Passes.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 #include "hexagon/NSP/NSPPasses.h"
@@ -115,7 +116,8 @@ static void buildNSPShardPipeline(OpPassManager &pm,
   //   - compute per-NSP tensor slices (extract_slice/subview),
   //   - materialize collectives (all-reduce/all-gather/all-to-all),
   //   - rewrite compute ops to operate on local tiles.
-  pm.addPass(createNSPSpmdizePass());
+
+  // pm.addPass(createNSPSpmdizePass());
 
   // 4. Cleanup
   if (opts.canonicalize) {

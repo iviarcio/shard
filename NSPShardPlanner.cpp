@@ -170,8 +170,9 @@ private:
       return grid;
 
     b.setInsertionPointToStart(module.getBody());
-    auto shapeAttr = b.getI64ArrayAttr({nspCount});
-    return b.create<shard::GridOp>(module.getLoc(), "nsp", shapeAttr);
+    SmallVector<int64_t, 1> shape = {nspCount};
+    return b.create<shard::GridOp>(module.getLoc(), "nsp",
+                                   llvm::ArrayRef<int64_t>(shape));
   }
 
   /// Build a sharding plan for a linalg.generic op.
@@ -508,8 +509,8 @@ private:
     /// Even if all dimensions are replicated, an explicit rank-sized array
     /// is returned.
     auto buildSplitAxesForOperand = [&](AffineMap map,
-                                        RankedTensorType rtt) -> ArrayAttr {
-      SmallVector<Attribute> perDimAxes;
+                                        RankedTensorType rtt) -> SmallVector<shard::GridAxesAttr> {
+      SmallVector<shard::GridAxesAttr> perDimAxes;
       perDimAxes.reserve(rtt.getRank());
 
       // map: (loops...) -> (tensor_dims...)
@@ -537,7 +538,7 @@ private:
 
       // Note: Even if all entries are empty, we still return an array of size
       // 'rank' (e.g. `[[], [], ...]`), which is a valid "replicated" encoding.
-      return ArrayAttr::get(ctx, perDimAxes);
+      return perDimAxes;
     };
 
     /// Materialize a `!shard.sharding` SSA value for a tensor operand.
@@ -564,7 +565,7 @@ private:
         return Value();
 
       // Build split_axes = [ GridAxesAttr, GridAxesAttr, ... ] (rank entries).
-      ArrayAttr splitAxesAttr = buildSplitAxesForOperand(map, rtt);
+      SmallVector<shard::GridAxesAttr> splitAxes = buildSplitAxesForOperand(map, rtt);
 
       // shard.sharding takes a symbol ref to the grid (e.g. @nsp).
       auto gridRef = FlatSymbolRefAttr::get(grid.getSymNameAttr());
@@ -574,9 +575,9 @@ private:
       auto shardingOp = b.create<shard::ShardingOp>(
           loc,
           /*grid=*/gridRef,
-          /*split_axes=*/splitAxesAttr,
-          /*static_halo_sizes=*/ArrayRef<int64_t>{},
-          /*static_sharded_dims_offsets=*/ArrayRef<int64_t>{});
+          /*split_axes=*/llvm::ArrayRef<shard::GridAxesAttr>(splitAxes),
+          /*static_halo_sizes=*/llvm::ArrayRef<int64_t>{},
+          /*static_sharded_dims_offsets=*/llvm::ArrayRef<int64_t>{});
 
       return shardingOp.getResult(); // !shard.sharding
     };
