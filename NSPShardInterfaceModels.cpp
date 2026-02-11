@@ -365,6 +365,9 @@ struct MaterializeInDestShardingModel
 
 } // namespace
 
+namespace mlir {
+namespace hexagon {
+
 /// Register all external sharding interface models used by the NSP pipeline.
 ///
 /// Call this during compiler initialization (DialectRegistry setup).
@@ -383,3 +386,6 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
             MaterializeInDestShardingModel>(*ctx);
       });
 }
+
+} // namespace hexagon
+} // namespace mlir
