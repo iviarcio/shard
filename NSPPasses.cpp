@@ -25,6 +25,9 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 
 // Useful common transforms.
 #include "mlir/Transforms/Passes.h"        // canonicalizer, cse
@@ -32,6 +35,9 @@
 // shard dialect IR (GridOp, ShardOp, collectives, attrs).
 #include "mlir/Dialect/Shard/Transforms/Passes.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
+#include "hexagon/NSP/NSPPasses.h"
 
 // NSP pieces.
 namespace mlir {
@@ -97,7 +103,7 @@ static void buildNSPShardPipeline(OpPassManager &pm,
   // This pass relies on shard::ShardingInterface models for ops in the graph.
   // Our NSPShardInterfaceModels.cpp attaches missing models.
   if (opts.runPropagation) {
-    pm.addPass(shard::createShardingPropagationPass());
+    pm.addPass(shard::createShardingPropagation());
   }
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());

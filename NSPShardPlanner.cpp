@@ -127,7 +127,7 @@ struct NSPShardPlannerPass
     func.walk([&](linalg::GenericOp op) {
       linalg::LinalgOp linalgOp(op);
       // Only handle ops with ranked tensor semantics (needs pre-bufferization).
-      if (linalgOp.hasTensorSemantics())
+      if (linalgOp.hasPureTensorSemantics())
         generics.push_back(op);
     });
 
@@ -188,16 +188,16 @@ private:
                                                  const ShardPolicy &policy) {
     ShardPlan plan;
 
-    // Extract iterator types.
-    SmallVector<StringRef> iters;
+    // Extract iterator types 
+    SmallVector<mlir::utils::IteratorType> iters;
     iters.reserve(op.getNumLoops());
-    for (Attribute a : op.getIteratorTypesArray())
-      iters.push_back(cast<StringAttr>(a).getValue());
+    for (mlir::utils::IteratorType it : op.getIteratorTypesArray())
+      iters.push_back(it);
 
     // Identify output indexing map
     // We assume single output for simplicity (generalize as needed).
     linalg::LinalgOp linalgOp(op);
-    if (linalgOp.getNumOutputs() != 1)
+    if (linalgOp.getNumDpsInits() != 1)
       return failure();
     AffineMap outMap = op.getIndexingMapsArray().back();
 
@@ -220,11 +220,12 @@ private:
   }
 
   /// Decide which iterator to shard based on output map and iterator_types.
-  ///
   /// \returns the loop iterator index, or -1 if no suitable iterator exists.
-  static int64_t pickShardIteratorIndex(AffineMap outMap,
-                                       ArrayRef<StringRef> iteratorTypes,
-                                       const ShardPolicy &policy) {
+  static int64_t pickShardIteratorIndex(
+      AffineMap outMap,
+      ArrayRef<mlir::utils::IteratorType> iteratorTypes,
+      const ShardPolicy &policy) {
+
     // We want an iterator that:
     //   (1) is "parallel"
     //   (2) appears as a plain AffineDimExpr in the output map results.
@@ -238,7 +239,7 @@ private:
       int64_t iterIdx = dim.getPosition();
       if (iterIdx < 0 || iterIdx >= (int64_t)iteratorTypes.size())
         continue;
-      if (iteratorTypes[iterIdx] == "parallel")
+      if (iteratorTypes[iterIdx] == mlir::utils::IteratorType::parallel)
         return iterIdx;
     }
     return -1;
@@ -298,13 +299,13 @@ private:
     linalg::LinalgOp linalgOp(op);
 
     // Must have at least 2 inputs + 1 output for matmul-like.
-    if (linalgOp.getNumInputs() < 2 || linalgOp.getNumOutputs() < 1)
+    if (linalgOp.getNumDpsInputs() < 2 || linalgOp.getNumDpsInits() < 1)
       return false;
 
     auto maps = op.getIndexingMapsArray();
     AffineMap aMap = maps[0];
     AffineMap bMap = maps[1];
-    AffineMap cMap = maps[linalgOp.getNumInputs() + 0];
+    AffineMap cMap = maps[linalgOp.getNumDpsInputs() + 0];
 
     // Ensure maps are simple permutations/projections.
     if (!isProjectedPermutationOfDims(aMap) ||
@@ -410,8 +411,8 @@ private:
         iters[shardIter] == utils::IteratorType::reduction) {
       // Look at the first output map (common case).
       auto maps = op.getIndexingMapsArray();
-      if (linalgOp.getNumOutputs() > 0) {
-        AffineMap outMap = maps[linalgOp.getNumInputs() + 0];
+      if (linalgOp.getNumDpsInits() > 0) {
+        AffineMap outMap = maps[linalgOp.getNumDpsInputs() + 0];
         auto outUsed = collectLoopItersUsedByMap(outMap);
         // If the output does not depend on the sharded reduction iter,
         // then shards are computing partial sums for the same output -> needs all-reduce.
@@ -432,9 +433,9 @@ private:
       return t == utils::IteratorType::reduction;
     });
 
-    if (hasReduction && op.getNumOutputs() > 0) {
+    if (hasReduction && op.getNumDpsInits() > 0) {
       auto maps = op.getIndexingMapsArray();
-      AffineMap outMap = maps[linalgOp.getNumInputs() + 0];
+      AffineMap outMap = maps[linalgOp.getNumDpsInputs() + 0];
       auto outUsed = collectLoopItersUsedByMap(outMap);
 
       if (!outUsed.contains(shardIter)) {
@@ -526,11 +527,11 @@ private:
         if (splitThisDim) {
           // Shard this tensor dimension on grid axis 0.
           perDimAxes.push_back(
-              shard::GridAxesAttr::get(ctx, ArrayRef<int64_t>{0}));
+              shard::GridAxesAttr::get(ctx, ArrayRef<int16_t>{0}));
         } else {
           // Replicated tensor dimension.
           perDimAxes.push_back(
-              shard::GridAxesAttr::get(ctx, ArrayRef<int64_t>{}));
+              shard::GridAxesAttr::get(ctx, ArrayRef<int16_t>{}));
         }
       }
 
@@ -592,8 +593,8 @@ private:
 
     // Wrap each tensor input with shard.shard.
     SmallVector<Value> newInputs;
-    newInputs.reserve(linalgOp.getNumInputs());
-    for (unsigned i = 0; i < linalgOp.getNumInputs(); ++i) {
+    newInputs.reserve(linalgOp.getNumDpsInputs());
+    for (unsigned i = 0; i < linalgOp.getNumDpsInputs(); ++i) {
       Value in = op.getInputs()[i];
       AffineMap map = maps[i];
       Value shardingVal = buildShardingValueFor(map, in);
@@ -612,10 +613,10 @@ private:
 
     // Wrap each tensor output (init tensor) with shard.shard.
     SmallVector<Value> newOutputs;
-    newOutputs.reserve(linalgOp.getNumOutputs());
-    for (unsigned oi = 0; oi < linalgOp.getNumOutputs(); ++oi) {
+    newOutputs.reserve(linalgOp.getNumDpsInits());
+    for (unsigned oi = 0; oi < linalgOp.getNumDpsInits(); ++oi) {
       Value out = op.getOutputs()[oi];
-      AffineMap map = maps[linalgOp.getNumInputs() + oi];
+      AffineMap map = maps[linalgOp.getNumDpsInputs() + oi];
       Value shardingVal = buildShardingValueFor(map, out);
       if (!shardingVal) {
         newOutputs.push_back(out);
@@ -651,10 +652,11 @@ private:
 
     // Preserve any extra attributes on the original generic op.
     // Avoid overwriting the structural attributes that define the generic itself.
+    auto indexingMapsName = StringAttr::get(op->getContext(), "indexing_maps");
+    auto iteratorTypesName = StringAttr::get(op->getContext(), "iterator_types");
     for (auto na : op->getAttrs()) {
       auto name = na.getName();
-      if (name == linalg::GenericOp::getIndexingMapsAttrName() ||
-          name == linalg::GenericOp::getIteratorTypesAttrName())
+      if (name == indexingMapsName || name == iteratorTypesName)
         continue;
       newOp->setAttr(name, na.getValue());
     }
