@@ -32,6 +32,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -45,7 +46,6 @@
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
-#include "hexagon/Conversion/LinalgToLLVM/NSPShardOptions.h"
 #include "hexagon/Transforms/OptionsParsing.h"
 
 #define DEBUG_TYPE "nsp-splanner"
@@ -125,8 +125,9 @@ struct NSPShardPlannerPass
     SmallVector<linalg::GenericOp> generics;
 
     func.walk([&](linalg::GenericOp op) {
+      linalg::LinalgOp linalgOp(op);
       // Only handle ops with ranked tensor semantics (needs pre-bufferization).
-      if (op.hasTensorSemantics())
+      if (linalgOp.hasTensorSemantics())
         generics.push_back(op);
     });
 
@@ -195,7 +196,8 @@ private:
 
     // Identify output indexing map
     // We assume single output for simplicity (generalize as needed).
-    if (op.getNumOutputs() != 1)
+    linalg::LinalgOp linalgOp(op);
+    if (linalgOp.getNumOutputs() != 1)
       return failure();
     AffineMap outMap = op.getIndexingMapsArray().back();
 
@@ -242,6 +244,27 @@ private:
     return -1;
   }
 
+  /// Return the set of loop iterator indices used by an affine map result list.
+  /// We only consider direct AffineDimExpr (no affine.apply or arithmetic),
+  /// keeping this intentionally conservative.
+  static llvm::SmallDenseSet<int64_t>
+  collectLoopItersUsedByMap(AffineMap map) {
+    llvm::SmallDenseSet<int64_t> used;
+    for (AffineExpr e : map.getResults()) {
+      if (auto d = dyn_cast<AffineDimExpr>(e))
+        used.insert(d.getPosition());
+    }
+    return used;
+  }
+
+  /// Return true if the map is a pure projected permutation from loop dims to
+  /// tensor dims (i.e. results are distinct AffineDimExpr).
+  static bool isProjectedPermutationOfDims(AffineMap map) {
+    // MLIR already provides a check.
+    // This will be false if there is any arithmetic / symbols / repeated dims.
+    return map.isProjectedPermutation();
+  }
+
   /// Recognize the canonical 2D matmul contraction pattern:
   ///   iterators: [parallel, parallel, reduction]
   ///   maps: A(i,k), B(k,j), C(i,j)
@@ -271,14 +294,17 @@ private:
     if (parallelIters.size() != 2 || reductionIters.size() != 1)
       return false;
 
+    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    linalg::LinalgOp linalgOp(op);
+
     // Must have at least 2 inputs + 1 output for matmul-like.
-    if (op.getNumInputs() < 2 || op.getNumOutputs() < 1)
+    if (linalgOp.getNumInputs() < 2 || linalgOp.getNumOutputs() < 1)
       return false;
 
     auto maps = op.getIndexingMapsArray();
     AffineMap aMap = maps[0];
     AffineMap bMap = maps[1];
-    AffineMap cMap = maps[op.getNumInputs() + 0];
+    AffineMap cMap = maps[linalgOp.getNumInputs() + 0];
 
     // Ensure maps are simple permutations/projections.
     if (!isProjectedPermutationOfDims(aMap) ||
@@ -367,6 +393,9 @@ private:
       return true;
     }
 
+    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    linalg::LinalgOp linalgOp(op);
+
     // Conservative fallback:
     // ---------------------
     // If shardIter is a reduction iterator, it often implies each shard computes a
@@ -381,8 +410,8 @@ private:
         iters[shardIter] == utils::IteratorType::reduction) {
       // Look at the first output map (common case).
       auto maps = op.getIndexingMapsArray();
-      if (op.getNumOutputs() > 0) {
-        AffineMap outMap = maps[op.getNumInputs() + 0];
+      if (linalgOp.getNumOutputs() > 0) {
+        AffineMap outMap = maps[linalgOp.getNumInputs() + 0];
         auto outUsed = collectLoopItersUsedByMap(outMap);
         // If the output does not depend on the sharded reduction iter,
         // then shards are computing partial sums for the same output -> needs all-reduce.
@@ -405,7 +434,7 @@ private:
 
     if (hasReduction && op.getNumOutputs() > 0) {
       auto maps = op.getIndexingMapsArray();
-      AffineMap outMap = maps[op.getNumInputs() + 0];
+      AffineMap outMap = maps[linalgOp.getNumInputs() + 0];
       auto outUsed = collectLoopItersUsedByMap(outMap);
 
       if (!outUsed.contains(shardIter)) {
@@ -558,10 +587,13 @@ private:
     // Indexing maps are ordered as: inputs..., outputs...
     auto maps = op.getIndexingMapsArray();
 
+    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    linalg::LinalgOp linalgOp(op);
+
     // Wrap each tensor input with shard.shard.
     SmallVector<Value> newInputs;
-    newInputs.reserve(op.getNumInputs());
-    for (unsigned i = 0; i < op.getNumInputs(); ++i) {
+    newInputs.reserve(linalgOp.getNumInputs());
+    for (unsigned i = 0; i < linalgOp.getNumInputs(); ++i) {
       Value in = op.getInputs()[i];
       AffineMap map = maps[i];
       Value shardingVal = buildShardingValueFor(map, in);
@@ -580,10 +612,10 @@ private:
 
     // Wrap each tensor output (init tensor) with shard.shard.
     SmallVector<Value> newOutputs;
-    newOutputs.reserve(op.getNumOutputs());
-    for (unsigned oi = 0; oi < op.getNumOutputs(); ++oi) {
+    newOutputs.reserve(linalgOp.getNumOutputs());
+    for (unsigned oi = 0; oi < linalgOp.getNumOutputs(); ++oi) {
       Value out = op.getOutputs()[oi];
-      AffineMap map = maps[op.getNumInputs() + oi];
+      AffineMap map = maps[linalgOp.getNumInputs() + oi];
       Value shardingVal = buildShardingValueFor(map, out);
       if (!shardingVal) {
         newOutputs.push_back(out);
