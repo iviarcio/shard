@@ -28,6 +28,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -110,6 +111,11 @@ struct NSPShardPlannerPass
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPShardPlannerPass)
 
+  // Ensure Shard dialect is loaded
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::shard::ShardDialect>();
+  }
+
   // Pass command-line identifier
   StringRef getArgument() const override { return "nsp-shard-planner"; }
 
@@ -122,10 +128,11 @@ struct NSPShardPlannerPass
   NSPShardPlannerPass(const ShardPolicy &policy) : policy(policy) {}
 
   void runOnOperation() override {
-    func::FuncOp func = getOperation();
-    MLIRContext *ctx = func.getContext();
+    MLIRContext *ctx = &getContext();
+    ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
 
     // Ensure we have a shard.grid symbol available in the module.
+    func::FuncOp func = getOperation();
     ModuleOp module = func->getParentOfType<ModuleOp>();
     shard::GridOp grid = getOrCreateGrid(module, policy.nspCount);
 

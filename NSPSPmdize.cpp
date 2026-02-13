@@ -44,6 +44,9 @@ struct NSPSpmdizePass
   }
 
   void runOnOperation() final {
+    MLIRContext *ctx = &getContext();
+    ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
+
     ModuleOp module = getOperation();
 
     // 1) Validate that the expected grid symbol exists.
