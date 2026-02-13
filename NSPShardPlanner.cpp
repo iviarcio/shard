@@ -110,6 +110,14 @@ struct NSPShardPlannerPass
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPShardPlannerPass)
 
+  // Pass command-line identifier
+  StringRef getArgument() const override { return "nsp-shard-planner"; }
+
+  // Short help text for --list-passes and --help.
+  StringRef getDescription() const override {
+    return "Plan Shard dialect annotations for NSP multi-NPU pre-tiling";
+  }
+
   NSPShardPlannerPass() = default;
   NSPShardPlannerPass(const ShardPolicy &policy) : policy(policy) {}
 

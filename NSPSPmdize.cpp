@@ -37,8 +37,10 @@ struct NSPSpmdizePass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPSpmdizePass)
 
   StringRef getArgument() const final { return "nsp-spmdize"; }
+
   StringRef getDescription() const final {
     return "NSP stub SPMDization pass (validation-only placeholder)";
+    // return "SPMD transformation for NSP multi-core execution";
   }
 
   void runOnOperation() final {
