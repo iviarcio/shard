@@ -108,6 +108,8 @@ struct ShardPlan {
 struct NSPShardPlannerPass
     : public PassWrapper<NSPShardPlannerPass, OperationPass<func::FuncOp>> {
 
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPShardPlannerPass)
+
   NSPShardPlannerPass() = default;
   NSPShardPlannerPass(const ShardPolicy &policy) : policy(policy) {}
 
