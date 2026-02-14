@@ -95,18 +95,19 @@ struct NSPShardPipelineOptions
 static void buildNSPShardPipeline(OpPassManager &pm,
                                   const NSPShardPipelineOptions &opts) {
 
-  // 1. Planner (NSPShardPlannerPass in NSPShardPlanner.cpp)
-  pm.addPass(createNSPShardPlannerPass(opts.nspCount, opts.allowCollectives));
+  // 1. Planner (NSPShardPlannerPass in NSPShardPlanner.cpp. Runs on func.func)
+  pm.addNestedPass<func::FuncOp>(
+      createNSPShardPlannerPass(opts.nspCount, opts.allowCollectives));
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
   }
 
-  // 2. Sharding propagation (Shard dialect pass)
+  // 2. Sharding propagation (Shard dialect pass. Runs on func.func)
   // This pass relies on shard::ShardingInterface models for ops in the graph.
   // NSPShardInterfaceModels.cpp attaches missing models.
   if (opts.runPropagation) {
-    pm.addPass(shard::createShardingPropagation());
+    pm.addNestedPass<func::FuncOp>(shard::createShardingPropagation());
   }
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());

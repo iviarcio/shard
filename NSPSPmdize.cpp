@@ -36,15 +36,15 @@ struct NSPSpmdizePass
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPSpmdizePass)
 
+  NSPSpmdizePass() = default;
+
+  explicit NSPSpmdizePass(bool allowCollectives)
+    : allowCollectives(allowCollectives) {}
+
   StringRef getArgument() const final { return "nsp-spmdize"; }
 
   StringRef getDescription() const final {
-    return "NSP stub SPMDization pass (validation-only placeholder)";
-    // return "SPMD transformation for NSP multi-core execution";
-  }
-
-  std::unique_ptr<Pass> createNSPSpmdizePass() {
-    return std::make_unique<NSPSpmdizePass>();
+    return "SPMD transformation for NSP multi-core execution";
   }
 
   void runOnOperation() final {
@@ -52,6 +52,10 @@ struct NSPSpmdizePass
     ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
 
     ModuleOp module = getOperation();
+
+    // allowCollectives is currently plumbed through the pipeline for
+    // future materialization. The stub pass does not act on it yet.
+    (void)allowCollectives;
 
     // Validate that the expected grid symbol exists.
     // The planner currently creates shard.grid @nsp.
