@@ -55,6 +55,47 @@ using namespace mlir;
 
 namespace {
 
+/// Returns a ranked ShapedType rank from the first ranked shaped operand/result.
+/// Falls back to 0 if nothing is ranked (best-effort for propagation).
+static int64_t getFirstRankedShapedRank(Operation *op) {
+  auto getRank = [](Type t) -> std::optional<int64_t> {
+    if (auto st = dyn_cast<ShapedType>(t)) {
+      if (st.hasRank())
+        return st.getRank();
+    }
+    return std::nullopt;
+  };
+
+  for (Type t : op->getOperandTypes())
+    if (auto r = getRank(t))
+      return *r;
+  for (Type t : op->getResultTypes())
+    if (auto r = getRank(t))
+      return *r;
+
+  return 0;
+}
+
+static SmallVector<AffineMap> makeIdentityMapsForOp(Operation *op,
+                                                    int64_t rank) {
+  MLIRContext *ctx = op->getContext();
+  AffineMap id = AffineMap::getMultiDimIdentityMap(rank, ctx);
+
+  SmallVector<AffineMap> maps;
+  maps.reserve(op->getNumOperands() + op->getNumResults());
+  for (unsigned i = 0, e = op->getNumOperands() + op->getNumResults(); i < e; ++i)
+    maps.push_back(id);
+  return maps;
+}
+
+static SmallVector<utils::IteratorType> makeParallelIters(int64_t rank) {
+  SmallVector<utils::IteratorType> iters;
+  iters.reserve(rank);
+  for (int64_t i = 0; i < rank; ++i)
+    iters.push_back(utils::IteratorType::parallel);
+  return iters;
+}
+
 /// Convert a Sharding's split-axes into a ShardingArray.
 /// The interface-level ShardingOption stores loop->grid-axis assignment as
 /// `SmallVector<SmallVector<GridAxis>>`. For these ops we treat each tensor
@@ -142,17 +183,20 @@ struct ReinterpretCastShardingModel
     : public shard::ShardingInterface::ExternalModel<
           ReinterpretCastShardingModel, memref::ReinterpretCastOp> {
 
-  SmallVector<utils::IteratorType>
-  getLoopIteratorTypes(Operation *) const {
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+
+  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-  SmallVector<shard::ReductionKind>
-  getReductionLoopIteratorKinds(Operation *) const {
-    return {};
-  }
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
-    return {};
-  }
+
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
@@ -220,17 +264,21 @@ struct ReinterpretCastShardingModel
 struct ToTensorShardingModel
     : public shard::ShardingInterface::ExternalModel<ToTensorShardingModel,
                                                     bufferization::ToTensorOp> {
-  SmallVector<utils::IteratorType>
-  getLoopIteratorTypes(Operation *) const {
+
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+
+  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-  SmallVector<shard::ReductionKind>
-  getReductionLoopIteratorKinds(Operation *) const {
-    return {};
-  }
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
-    return {};
-  }
+
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
@@ -297,17 +345,20 @@ struct MaterializeInDestShardingModel
           MaterializeInDestShardingModel,
           bufferization::MaterializeInDestinationOp> {
 
-  SmallVector<utils::IteratorType>
-  getLoopIteratorTypes(Operation *) const {
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+
+  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
-  SmallVector<shard::ReductionKind>
-  getReductionLoopIteratorKinds(Operation *) const {
-    return {};
-  }
-  SmallVector<AffineMap> getIndexingMaps(Operation *) const {
-    return {};
-  }
+
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
