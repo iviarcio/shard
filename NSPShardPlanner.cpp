@@ -719,5 +719,13 @@ std::unique_ptr<Pass> createNSPShardPlannerPass() {
   return std::make_unique<NSPShardPlannerPass>();
 }
 
+std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
+                                                bool allowCollectives) {
+  ShardPolicy policy;
+  policy.nspCount = nspCount;
+  policy.allowCollectives = allowCollectives;
+  return std::make_unique<NSPShardPlannerPass>(policy);
+}
+
 } // namespace hexagon
 } // namespace mlir

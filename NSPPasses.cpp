@@ -45,7 +45,11 @@ namespace mlir {
 namespace hexagon {
 
 std::unique_ptr<Pass> createNSPShardPlannerPass();
+std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
+                                                bool allowCollectives);
+
 std::unique_ptr<Pass> createNSPSpmdizePass();
+std::unique_ptr<Pass> createNSPSpmdizePass(bool allowCollectives);
 
 // From NSPShardInterfaceModels.cpp (attach external models).
 void registerNSPShardInterfaceModels(DialectRegistry &registry);
@@ -92,9 +96,7 @@ static void buildNSPShardPipeline(OpPassManager &pm,
                                   const NSPShardPipelineOptions &opts) {
 
   // 1. Planner (NSPShardPlannerPass in NSPShardPlanner.cpp)
-  // To Planner options (nsp-count / allow-collectives) reach the
-  // pass, it exposes as pass options and plumb here.
-  pm.addPass(createNSPShardPlannerPass());
+  pm.addPass(createNSPShardPlannerPass(opts.nspCount, opts.allowCollectives));
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -102,7 +104,7 @@ static void buildNSPShardPipeline(OpPassManager &pm,
 
   // 2. Sharding propagation (Shard dialect pass)
   // This pass relies on shard::ShardingInterface models for ops in the graph.
-  // Our NSPShardInterfaceModels.cpp attaches missing models.
+  // NSPShardInterfaceModels.cpp attaches missing models.
   if (opts.runPropagation) {
     pm.addPass(shard::createShardingPropagation());
   }
@@ -112,12 +114,10 @@ static void buildNSPShardPipeline(OpPassManager &pm,
   }
 
   // 3. SPMDization / materialization
-  // This pass is expected to:
-  //   - compute per-NSP tensor slices (extract_slice/subview),
-  //   - materialize collectives (all-reduce/all-gather/all-to-all),
-  //   - rewrite compute ops to operate on local tiles.
-
-  // pm.addPass(createNSPSpmdizePass());
+  // - compute per-NSP tensor slices (extract_slice/subview),
+  // - materialize collectives (all-reduce/all-gather/all-to-all),
+  // - rewrite compute ops to operate on local tiles.
+  pm.addPass(createNSPSpmdizePass(opts.allowCollectives));
 
   // 4. Cleanup
   if (opts.canonicalize) {

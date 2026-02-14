@@ -43,27 +43,31 @@ struct NSPSpmdizePass
     // return "SPMD transformation for NSP multi-core execution";
   }
 
+  std::unique_ptr<Pass> createNSPSpmdizePass() {
+    return std::make_unique<NSPSpmdizePass>();
+  }
+
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
     ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
 
     ModuleOp module = getOperation();
 
-    // 1) Validate that the expected grid symbol exists.
-    //    The planner currently creates shard.grid @nsp.
+    // Validate that the expected grid symbol exists.
+    // The planner currently creates shard.grid @nsp.
     auto grid = module.lookupSymbol<mlir::shard::GridOp>("nsp");
     if (!grid) {
       module.emitError()
-          << "NSPSpmdizePass expected a 'shard.grid' symbol named '@nsp' "
-             "in the module, but none was found. "
-             "Ensure NSP shard planning ran and created the grid.";
+        << "NSPSpmdizePass expected a 'shard.grid' symbol named '@nsp' "
+           "in the module, but none was found. "
+           "Ensure NSP shard planning ran and created the grid.";
       signalPassFailure();
       return;
     }
 
-    // 2) Optionally sanity-check that we have some sharding descriptors.
-    //    This is a warning (not a hard error) because some pipelines may
-    //    legally run with no sharding yet (e.g. early bring-up).
+    // Optionally sanity-check that we have some sharding descriptors.
+    // This is a warning (not a hard error) because some pipelines may
+    // legally run with no sharding yet (e.g. early bring-up).
     int64_t numShardingOps = 0;
     module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
 
@@ -75,14 +79,22 @@ struct NSPSpmdizePass
              "sharding descriptors.";
     }
 
-    // 3) No-op transformation for now (future materialization will go here).
+    // No-op transformation for now (future materialization will go here).
   }
+
+private:
+  bool allowCollectives = false;
+
 };
 
 } // namespace
 
 std::unique_ptr<Pass> createNSPSpmdizePass() {
   return std::make_unique<NSPSpmdizePass>();
+}
+
+std::unique_ptr<Pass> createNSPSpmdizePass(bool allowCollectives) {
+  return std::make_unique<NSPSpmdizePass>(allowCollectives);
 }
 
 } // namespace hexagon
