@@ -320,6 +320,7 @@ struct ToTensorShardingModel
                                       const shard::ShardingOption &opt) const {
     // bufferization.to_tensor: memref -> tensor boundary.
     // Only the tensor result can carry sharding; the memref operand is ignored.
+
     if (op->getNumResults() != 1)
       return failure();
 
@@ -328,18 +329,39 @@ struct ToTensorShardingModel
     if (!resTy)
       return failure();
 
-    int64_t rank = resTy.getRank();
-    shard::Sharding resultSharding = fromShardingOption(op, opt, rank);
-
-    // If the chosen option does not prescribe sharding for the result, do nothing.
-    if (!resultSharding)
+    // If the option does not prescribe a grid, there is no sharding to attach.
+    if (!opt.grid)
       return success();
+
+    const int64_t rank = resTy.getRank();
+    MLIRContext *ctx = op->getContext();
+
+    // Materialize a !shard.sharding SSA value from the ShardingOption.
+    SmallVector<Attribute> splitAxesAttrs;
+    splitAxesAttrs.reserve(rank);
+
+    ArrayRef<SmallVector<shard::GridAxis>> arr = opt.shardingArray;
+    for (int64_t i = 0; i < rank; ++i) {
+      SmallVector<int16_t> axesI16;
+      if (i < (int64_t)arr.size()) {
+        axesI16.reserve(arr[i].size());
+        for (shard::GridAxis a : arr[i])
+          axesI16.push_back(static_cast<int16_t>(a));
+      }
+      splitAxesAttrs.push_back(shard::GridAxesAttr::get(ctx, axesI16));
+    }
+
+    auto splitAxesArrayAttr = ArrayAttr::get(ctx, splitAxesAttrs);
 
     b.setInsertionPointAfter(op);
 
-    // Insert shard.shard on the tensor result and forward all uses.
-    auto annotated =
-        b.create<shard::ShardOp>(op->getLoc(), resTy, res, resultSharding);
+    // Create shard.sharding @grid split_axes = [...] : !shard.sharding
+    auto shardingVal = b.create<shard::ShardingOp>(op->getLoc(), opt.grid,
+                                                  splitAxesArrayAttr);
+
+    // Annotate the tensor result.
+    auto annotated = b.create<shard::ShardOp>(op->getLoc(), resTy, res,
+                                             shardingVal.getResult());
 
     res.replaceAllUsesExcept(annotated.getResult(), annotated);
     return success();
