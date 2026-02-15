@@ -240,7 +240,7 @@ struct ReinterpretCastShardingModel
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
                                       const shard::ShardingOption &) const {
-    // No-op for memref ops.
+    (void)op;         // No-op for memref ops.
     return success();
   }
 
@@ -318,9 +318,31 @@ struct ToTensorShardingModel
 
   LogicalResult addShardingAnnotations(Operation *op, OpBuilder &b,
                                       const shard::ShardingOption &opt) const {
-    // Delegate to the shard default annotation inserter if possible.
-    // It will typically insert shard.shard ops for tensor results.
-    return shard::detail::defaultAddShardingAnnotations(op, b, opt);
+    // bufferization.to_tensor: memref -> tensor boundary.
+    // Only the tensor result can carry sharding; the memref operand is ignored.
+    if (op->getNumResults() != 1)
+      return failure();
+
+    Value res = op->getResult(0);
+    auto resTy = dyn_cast<RankedTensorType>(res.getType());
+    if (!resTy)
+      return failure();
+
+    int64_t rank = resTy.getRank();
+    shard::Sharding resultSharding = fromShardingOption(op, opt, rank);
+
+    // If the chosen option does not prescribe sharding for the result, do nothing.
+    if (!resultSharding)
+      return success();
+
+    b.setInsertionPointAfter(op);
+
+    // Insert shard.shard on the tensor result and forward all uses.
+    auto annotated =
+        b.create<shard::ShardOp>(op->getLoc(), resTy, res, resultSharding);
+
+    res.replaceAllUsesExcept(annotated.getResult(), annotated);
+    return success();
   }
 
   LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
