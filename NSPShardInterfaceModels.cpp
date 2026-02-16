@@ -46,6 +46,8 @@
 // Dialects / ops we model.
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 // Shard interface.
 #include "mlir/Dialect/Shard/Interfaces/ShardingInterface.h"
@@ -174,6 +176,61 @@ static LogicalResult partitionByCloning(Operation *op,
 
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// Scalar/Control flow
+//===----------------------------------------------------------------------===//
+
+/// Generic model for scalar/control-flow ops that do not participate in sharding.
+/// It tells shard-propagation to "ignore" the op instead of erroring out.
+template <typename OpTy>
+struct NoShardingModel
+    : public shard::ShardingInterface::ExternalModel<NoShardingModel<OpTy>, OpTy> {
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *) const {
+    return {};
+  }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
+  SmallVector<AffineMap> getIndexingMaps(Operation *) const { return {}; }
+
+  FailureOr<shard::ShardingOption>
+  getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
+                    ArrayRef<shard::Sharding> resultShardings) const {
+    (void)op;
+    (void)operandShardings;
+    (void)resultShardings;
+    return shard::ShardingOption::makeEmpty();
+  }
+
+  FailureOr<std::vector<shard::Sharding>>
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
+    (void)opt;
+    std::vector<shard::Sharding> res;
+    res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
+    return res;
+  }
+
+  LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
+                                      const shard::ShardingOption &) const {
+    return success();
+  }
+
+  LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding> operandShardings,
+                          ArrayRef<shard::Sharding> resultShardings,
+                          IRMapping &partitionMap,
+                          SymbolTableCollection &symbolTableCollection,
+                          OpBuilder &builder) const {
+    (void)operandShardings;
+    (void)resultShardings;
+    (void)symbolTableCollection;
+    return partitionByCloning(op, partitionedOperands, partitionMap, builder);
+  }
+};
 
 //===----------------------------------------------------------------------===//
 // memref.reinterpret_cast
@@ -464,15 +521,17 @@ namespace mlir {
 namespace hexagon {
 
 /// Register all external sharding interface models used by the NSP pipeline.
-///
-/// Call this during compiler initialization (DialectRegistry setup).
+/// This must be called during compiler initialization (DialectRegistry setup).
 void registerNSPShardInterfaceModels(DialectRegistry &registry) {
+
+  // Cover memref.reinterpret_cast
   registry.addExtension(+[](MLIRContext *ctx, memref::MemRefDialect *dialect) {
     (void)dialect;
     memref::ReinterpretCastOp::attachInterface<ReinterpretCastShardingModel>(
         *ctx);
   });
 
+  // Cover bufferization.to_tensor & bufferization.materialize_in_destination
   registry.addExtension(
       +[](MLIRContext *ctx, bufferization::BufferizationDialect *dialect) {
         (void)dialect;
@@ -480,6 +539,29 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
         bufferization::MaterializeInDestinationOp::attachInterface<
             MaterializeInDestShardingModel>(*ctx);
       });
+
+  // Cover the scf.for.
+  registry.addExtension(+[](MLIRContext *ctx, scf::SCFDialect *dialect) {
+    (void)dialect;
+    scf::ForOp::attachInterface<NoShardingModel<scf::ForOp>>(*ctx);
+
+    // Useful when loops start carrying tensors.
+    scf::YieldOp::attachInterface<NoShardingModel<scf::YieldOp>>(*ctx);
+  });
+
+  // Cover the usual scalar ops used in loop bounds.
+  registry.addExtension(+[](MLIRContext *ctx, arith::ArithDialect *dialect) {
+    (void)dialect;
+    arith::ConstantOp::attachInterface<NoShardingModel<arith::ConstantOp>>(*ctx);
+    arith::IndexCastOp::attachInterface<NoShardingModel<arith::IndexCastOp>>(*ctx);
+    arith::AddIOp::attachInterface<NoShardingModel<arith::AddIOp>>(*ctx);
+    arith::SubIOp::attachInterface<NoShardingModel<arith::SubIOp>>(*ctx);
+    arith::MulIOp::attachInterface<NoShardingModel<arith::MulIOp>>(*ctx);
+
+    // ... Add more as they appear.
+
+  });
+
 }
 
 } // namespace hexagon
