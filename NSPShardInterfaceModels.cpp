@@ -240,7 +240,7 @@ struct ReinterpretCastShardingModel
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
                                       const shard::ShardingOption &) const {
-    (void)op;         // No-op for memref ops.
+    // No-op for memref ops.
     return success();
   }
 
@@ -316,10 +316,12 @@ struct ToTensorShardingModel
     return res;
   }
 
+  /// Materializes sharding attaching a `shard.shard` op to the tensor result.
+  /// This op is a memref→tensor boundary and cannot carry sharding on the
+  /// memref operand. We therefore synthesize a `shard.sharding` value from the
+  /// inferred ShardingOption and annotate only the tensor result.
   LogicalResult addShardingAnnotations(Operation *op, OpBuilder &b,
                                       const shard::ShardingOption &opt) const {
-    // bufferization.to_tensor: memref -> tensor boundary.
-    // Only the tensor result can carry sharding; the memref operand is ignored.
 
     if (op->getNumResults() != 1)
       return failure();
@@ -337,8 +339,8 @@ struct ToTensorShardingModel
     MLIRContext *ctx = op->getContext();
 
     // Materialize a !shard.sharding SSA value from the ShardingOption.
-    SmallVector<Attribute> splitAxesAttrs;
-    splitAxesAttrs.reserve(rank);
+    SmallVector<shard::GridAxesAttr> splitAxes;
+    splitAxes.reserve(rank);
 
     ArrayRef<SmallVector<shard::GridAxis>> arr = opt.shardingArray;
     for (int64_t i = 0; i < rank; ++i) {
@@ -348,16 +350,17 @@ struct ToTensorShardingModel
         for (shard::GridAxis a : arr[i])
           axesI16.push_back(static_cast<int16_t>(a));
       }
-      splitAxesAttrs.push_back(shard::GridAxesAttr::get(ctx, axesI16));
+      splitAxes.push_back(shard::GridAxesAttr::get(ctx, axesI16));
     }
 
-    auto splitAxesArrayAttr = ArrayAttr::get(ctx, splitAxesAttrs);
+    // Get the shard-typed array attribute.
+    auto splitAxesAttr = shard::GridAxesArrayAttr::get(ctx, splitAxes);
 
     b.setInsertionPointAfter(op);
 
-    // Create shard.sharding @grid split_axes = [...] : !shard.sharding
-    auto shardingVal = b.create<shard::ShardingOp>(op->getLoc(), opt.grid,
-                                                  splitAxesArrayAttr);
+    // Build shard.sharding using the overload that takes GridAxesArrayAttr.
+    auto shardingVal =
+        b.create<shard::ShardingOp>(op->getLoc(), opt.grid, splitAxesAttr);
 
     // Annotate the tensor result.
     auto annotated = b.create<shard::ShardOp>(op->getLoc(), resTy, res,
