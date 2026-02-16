@@ -353,14 +353,11 @@ struct ToTensorShardingModel
       splitAxes.push_back(shard::GridAxesAttr::get(ctx, axesI16));
     }
 
-    // Get the shard-typed array attribute.
-    auto splitAxesAttr = shard::GridAxesArrayAttr::get(ctx, splitAxes);
-
     b.setInsertionPointAfter(op);
 
-    // Build shard.sharding using the overload that takes GridAxesArrayAttr.
+    // Build shard.sharding using the overload that takes ArrayRef<GridAxesAttr>.
     auto shardingVal =
-        b.create<shard::ShardingOp>(op->getLoc(), opt.grid, splitAxesAttr);
+        b.create<shard::ShardingOp>(op->getLoc(), opt.grid, splitAxes);
 
     // Annotate the tensor result.
     auto annotated = b.create<shard::ShardOp>(op->getLoc(), resTy, res,
