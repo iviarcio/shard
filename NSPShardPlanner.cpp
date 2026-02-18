@@ -634,6 +634,50 @@ private:
     newOutputs.reserve(linalgOp.getNumDpsInits());
     for (unsigned oi = 0; oi < linalgOp.getNumDpsInits(); ++oi) {
       Value out = op.getOutputs()[oi];
+
+      // The 'outs' operands of linalg.generic are *init tensors* (destination-style).
+      // They must match the result type and be suitable for SPMD partitioning.
+      //
+      // Some early pipelines produce linalg.generic with outs accidentally tied to an
+      // input tensor (e.g. a read-modify-write pattern over the input). This breaks
+      // shard-partition: the pass localizes the result type (per-shard tile), but the
+      // outs operand remains global, triggering verifier errors.
+      //
+      // Fix-up: if an outs operand aliases an input, synthesize a fresh init tensor
+      // (tensor.empty) with the same type as the corresponding op result.
+      auto aliasesAnyInput = [&]() -> bool {
+        for (Value in : op.getInputs())
+          if (in == out)
+            return true;
+        return false;
+      };
+
+      if (aliasesAnyInput() && oi < op->getNumResults()) {
+        auto resTy = dyn_cast<RankedTensorType>(op->getResult(oi).getType());
+        if (resTy) {
+          SmallVector<Value> dynSizes;
+          dynSizes.reserve(resTy.getNumDynamicDims());
+
+          // For dynamic dimensions, use tensor.dim on the first input as a size source.
+          // This is safe for elementwise ops where shapes are expected to match.
+          Value sizeSource =
+             !op.getInputs().empty() ? op.getInputs().front() : Value();
+          for (int64_t d = 0, e = resTy.getRank(); d < e; ++d) {
+            if (resTy.isDynamicDim(d)) {
+              // If we don't have a size source, we can't build a well-formed empty.
+              // Keep the original outs in that (rare) case.
+              if (!sizeSource)
+                break;
+              dynSizes.push_back(b.create<tensor::DimOp>(loc, sizeSource, d));
+            }
+          }
+          if ((int64_t)dynSizes.size() == resTy.getNumDynamicDims()) {
+            out = b.create<tensor::EmptyOp>(loc, resTy.getShape(),
+                                           resTy.getElementType(), dynSizes);
+          }
+        }
+      }
+
       AffineMap map = maps[linalgOp.getNumDpsInputs() + oi];
       Value shardingVal = buildShardingValueFor(map, out);
       if (!shardingVal) {
