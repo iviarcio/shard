@@ -7,10 +7,11 @@
 //
 // NSP SPMDization/materialization pass.
 //
-// This pass performs a minimal bring-up materialization for multi-NSP execution.
+// This pass performs a minimal bring-up materialization for NSP multi-core
+// execution.
 //
-// Today it targets the simplest sharded elementwise patterns (e.g. vadd) and
-// rewrites them into:
+// The current implementation targets the simplest sharded elementwise patterns
+// (e.g. vadd expressed as linalg.generic) and rewrites them into:
 //   - per-core local slices using shard.all_slice
 //   - local compute (linalg.generic) on the sliced tensors
 //   - optional reconstitution using shard.all_gather when a global value is
@@ -28,6 +29,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -57,7 +59,7 @@ struct NSPSpmdizePass
   StringRef getArgument() const final { return "nsp-spmdize"; }
 
   StringRef getDescription() const final {
-    return "SPMD transformation for NSP multi-core execution";
+    return "SPMD transformation for multi-NSP execution";
   }
 
   void runOnOperation() final {
@@ -101,8 +103,10 @@ struct NSPSpmdizePass
     }
 
     // Optionally sanity-check that we have some sharding descriptors.
+    // This is a warning (not a hard error) because some pipelines may
+    // legally run with no sharding yet (e.g. early bring-up).
     int64_t numShardingOps = 0;
-    module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
+    module.walk([&](mlir::shard::ShardingOp op) { numShardingOps; });
 
     if (numShardingOps == 0) {
       module.emitWarning()
@@ -124,43 +128,41 @@ struct NSPSpmdizePass
     const SmallVector<mlir::shard::GridAxis> gridAxes = {
         static_cast<mlir::shard::GridAxis>(0)};
     const int64_t splitAxis = 0;
+    const llvm::APInt splitAxisAP(/*numBits=*/64, /*val=*/splitAxis,
+                                  /*isSigned=*/true);
 
     // Helper to compute a "local" tensor type for split along axis 0.
     auto getLocalType = [&](RankedTensorType globalTy) -> RankedTensorType {
-      assert(globalTy && "expected ranked tensor type");
-      SmallVector<int64_t> shape(globalTy.getShape().begin(),
-                                 globalTy.getShape().end());
-      if (shape.empty())
-        return globalTy;
-      int64_t dim0 = shape[0];
+      if (!globalTy || globalTy.getRank() == 0)
+        return RankedTensorType();
+      int64_t dim0 = globalTy.getDimSize(0);
       if (ShapedType::isDynamic(dim0))
         return RankedTensorType();
       if (dim0 % numShards != 0)
         return RankedTensorType();
-      shape[0] = dim0 / numShards;
-      return RankedTensorType::get(shape, globalTy.getElementType(),
+      SmallVector<int64_t> newShape(globalTy.getShape().begin(),
+                                    globalTy.getShape().end());
+      newShape[0] = dim0 / numShards;
+      return RankedTensorType::get(newShape, globalTy.getElementType(),
                                    globalTy.getEncoding());
     };
 
-    // Rewrite matching patterns per-function.
-    module.walk([&](func::FuncOp func) {
+    module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
 
-      // Use a worklist since we will mutate the IR.
-      SmallVector<linalg::GenericOp> generics;
-      func.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+      // Worklist since we'll rewrite in-place.
+      SmallVector<mlir::linalg::GenericOp> worklist;
+      func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
 
-      for (linalg::GenericOp g : generics) {
-        // Pattern: elementwise vadd-like generic
-        // 2 inputs, 1 output, 1 loop, parallel iterator, identity indexing maps
+      for (mlir::linalg::GenericOp g : worklist) {
+        // Pattern: elementwise 1D generic with identity maps.
         if (g.getNumDpsInputs() != 2 || g.getNumDpsInits() != 1)
           continue;
-
         if (g.getNumLoops() != 1)
           continue;
-
         auto iters = g.getIteratorTypesArray();
-        if (iters.size() != 1 || iters.front() != utils::IteratorType::parallel)
+        if (iters.size() != 1 ||
+            iters.front() != mlir::utils::IteratorType::parallel)
           continue;
 
         auto maps = g.getIndexingMapsArray();
@@ -172,6 +174,7 @@ struct NSPSpmdizePass
 
         Value in0 = g.getDpsInputOperand(0)->get();
         Value in1 = g.getDpsInputOperand(1)->get();
+        Value oldInit = g.getDpsInitOperand(0)->get();
 
         auto in0Ty = dyn_cast<RankedTensorType>(in0.getType());
         auto in1Ty = dyn_cast<RankedTensorType>(in1.getType());
@@ -179,22 +182,24 @@ struct NSPSpmdizePass
         if (!in0Ty || !in1Ty || !outResTy)
           continue;
 
-        // Only split along axis 0 for now.
-        auto localResTy = getLocalType(outResTy);
-        if (!localResTy) {
-          g.emitError() << "NSPSpmdize: cannot compute local tile type for result "
+        // Restrict to 1D tensors for now.
+        if (in0Ty.getRank() != 1 || in1Ty.getRank() != 1 ||
+            outResTy.getRank() != 1)
+          continue;
+
+        auto localTy = getLocalType(outResTy);
+        if (!localTy) {
+          g.emitError() << "NSPSpmdize: cannot compute local tile type for "
+                           "result "
                         << outResTy << " with grid size " << numShards
                         << " (requires static dim0 divisible by grid size)";
           signalPassFailure();
           return;
         }
 
-        // Inputs must be compatible with the result tile type.
-        auto localIn0Ty = getLocalType(in0Ty);
-        auto localIn1Ty = getLocalType(in1Ty);
-        if (!localIn0Ty || !localIn1Ty || localIn0Ty != localResTy ||
-            localIn1Ty != localResTy) {
-          g.emitError() << "NSPSpmdize: unsupported elementwise generic; input/result "
+        // Inputs must be consistently splittable.
+        if (getLocalType(in0Ty) != localTy || getLocalType(in1Ty) != localTy) {
+          g.emitError() << "NSPSpmdize: unsupported elementwise generic; input "
                            "types are not consistently splittable along axis 0";
           signalPassFailure();
           return;
@@ -203,29 +208,37 @@ struct NSPSpmdizePass
         Location loc = g.getLoc();
         b.setInsertionPoint(g);
 
-        // Slice inputs.
-        // Note: grid is referenced by symbol name ("nsp") so it remains stable
-        // under cloning/moving.
-        Value in0Local = b.create<mlir::shard::AllSliceOp>(
-            loc, localIn0Ty, in0, /*grid=*/"nsp", gridAxes, splitAxis);
-        Value in1Local = b.create<mlir::shard::AllSliceOp>(
-            loc, localIn1Ty, in1, /*grid=*/"nsp", gridAxes, splitAxis);
+        // Slice inputs into per-core tiles.
+        Value in0Local = mlir::shard::AllSliceOp::create(
+                           b, loc, /*result_type=*/localTy,
+                           /*input=*/in0,
+                           /*grid=*/"nsp",
+                           /*gridAxes=*/gridAxes,
+                           /*sliceAxis=*/splitAxis)
+                           .getResult();
+        Value in1Local = mlir::shard::AllSliceOp::create(
+                           b, loc, /*result_type=*/localTy,
+                           /*input=*/in1,
+                           /*grid=*/"nsp",
+                           /*gridAxes=*/gridAxes,
+                           /*sliceAxis=*/splitAxis)
+                           .getResult();
 
-        // Create or reuse a local init tensor for the output.
-        // If a previous pass already produced a correctly-typed local init,
-        // reuse it; otherwise, synthesize a fresh tensor.empty.
-        Value oldInit = g.getDpsInitOperand(0)->get();
+        // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
         auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
-        if (!oldInitTy || oldInitTy != localResTy) {
-          outLocalInit = b.create<tensor::EmptyOp>(
-              loc, localResTy.getShape(), localResTy.getElementType());
+        if (!oldInitTy || oldInitTy != localTy) {
+          outLocalInit = b.create<mlir::tensor::EmptyOp>(
+              loc, localTy.getShape(), localTy.getElementType());
         }
 
         // Clone the generic op with local operands.
-        auto newGeneric = b.create<linalg::GenericOp>(
-            loc, localResTy, ValueRange{in0Local, in1Local},
-            ValueRange{outLocalInit}, g.getIndexingMaps(), g.getIteratorTypes(),
+        auto newGeneric = b.create<mlir::linalg::GenericOp>(
+            loc, /*resultTensorTypes=*/TypeRange{localTy},
+            /*inputs=*/ValueRange{in0Local, in1Local},
+            /*outputs=*/ValueRange{outLocalInit},
+            /*indexingMaps=*/g.getIndexingMaps(),
+            /*iteratorTypes=*/g.getIteratorTypes(),
             /*doc=*/nullptr, /*libraryCall=*/nullptr);
 
         // Move the region body (elementwise computation) over.
@@ -240,14 +253,16 @@ struct NSPSpmdizePass
           signalPassFailure();
           return;
         }
-        replacement = b.create<mlir::shard::AllGatherOp>(
-            loc, outResTy, replacement, /*grid=*/"nsp", gridAxes, splitAxis);
+        replacement = mlir::shard::AllGatherOp::create(
+                           b, loc, /*result=*/outResTy,
+                           /*grid=*/"nsp",
+                           /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxes),
+                           /*input=*/replacement,
+                           /*gather_axis=*/splitAxisAP)
+                           .getResult();
 
         g.replaceAllUsesWith(replacement);
         g.erase();
-
-        // NOTE: We intentionally do not attempt to clean up now-dead shard.shard
-        // wrappers here. Canonicalization/CSE later in the pipeline can handle it.
       }
     });
   }
