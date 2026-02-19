@@ -106,7 +106,7 @@ struct NSPSpmdizePass
     // This is a warning (not a hard error) because some pipelines may
     // legally run with no sharding yet (e.g. early bring-up).
     int64_t numShardingOps = 0;
-    module.walk([&](mlir::shard::ShardingOp op) { numShardingOps; });
+    module.walk([&](mlir::shard::ShardingOp op) { ++numShardingOps; });
 
     if (numShardingOps == 0) {
       module.emitWarning()
@@ -127,6 +127,8 @@ struct NSPSpmdizePass
     // sharding annotations and parameter plumbing.
     const SmallVector<mlir::shard::GridAxis> gridAxes = {
         static_cast<mlir::shard::GridAxis>(0)};
+    // Some Shard ops (e.g. all_gather) expect grid_axes as i16.
+    const SmallVector<int16_t> gridAxesI16 = {static_cast<int16_t>(0)};
     const int64_t splitAxis = 0;
     const llvm::APInt splitAxisAP(/*numBits=*/64, /*val=*/splitAxis,
                                   /*isSigned=*/true);
@@ -256,12 +258,11 @@ struct NSPSpmdizePass
         replacement = mlir::shard::AllGatherOp::create(
                            b, loc, /*result=*/outResTy,
                            /*grid=*/"nsp",
-                           /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxes),
+                           /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
                            /*input=*/replacement,
-                           /*gather_axis=*/splitAxisAP)
-                           .getResult();
+                           /*gather_axis=*/splitAxisAP).getResult();
 
-        g.replaceAllUsesWith(replacement);
+        g.getResult(0).replaceAllUsesWith(replacement);
         g.erase();
       }
     });
