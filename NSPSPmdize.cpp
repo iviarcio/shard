@@ -28,6 +28,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
@@ -54,13 +55,22 @@ struct NSPSpmdizePass
   NSPSpmdizePass() = default;
 
   explicit NSPSpmdizePass(bool allowCollectives)
-    : allowCollectives(allowCollectives) {}
+    : allowCollectives(*this, "allow-collectives",
+                       llvm::cl::desc("Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
+                       llvm::cl::init(false)) {
+    allowCollectives = allow;
+  }
 
   StringRef getArgument() const final { return "nsp-spmdize"; }
 
   StringRef getDescription() const final {
     return "SPMD transformation for multi-NSP execution";
   }
+
+  Option<bool> allowCollectives{
+      *this, "allow-collectives",
+      llvm::cl::desc("Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
+      llvm::cl::init(false)};
 
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
@@ -249,7 +259,7 @@ struct NSPSpmdizePass
         // Bring-up path: reconstitute to the original global type so existing
         // bufferization.materialize_in_destination keeps working.
         Value replacement = newGeneric.getResult(0);
-        if (!allowCollectives) {
+        if (!allowCollectives.getValue()) {
           g.emitError() << "NSPSpmdize: rewriting requires shard.all_gather but "
                            "collectives are disabled";
           signalPassFailure();
@@ -269,7 +279,6 @@ struct NSPSpmdizePass
   }
 
 private:
-  bool allowCollectives = false;
 
 };
 
