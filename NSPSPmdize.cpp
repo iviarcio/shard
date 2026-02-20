@@ -52,14 +52,22 @@ struct NSPSpmdizePass
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(NSPSpmdizePass)
 
-  NSPSpmdizePass() = default;
+  NSPSpmdizePass() : NSPSpmdizePass(/*allowCollectives=*/false) {}
 
-  explicit NSPSpmdizePass(bool allowCollectives)
-    : allowCollectives(*this, "allow-collectives",
-                       llvm::cl::desc("Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
-                       llvm::cl::init(false)) {
-    allowCollectives = allow;
-  }
+  /// Programmatic construction used by createNSPSpmdizePass(bool).
+  explicit NSPSpmdizePass(bool allow)
+      : PassWrapper(),
+        allowCollectives(
+            *this, "allow-collectives",
+            llvm::cl::desc(
+                "Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
+            llvm::cl::init(allow)) {}
+
+  /// PassWrapper's default clonePass implementation relies on a copy
+  /// constructor. Pass::Option is not copyable, so we must explicitly define
+  /// a copy constructor that re-initializes the options from values.
+  NSPSpmdizePass(const NSPSpmdizePass &other)
+      : NSPSpmdizePass(static_cast<bool>(other.allowCollectives)) {}
 
   StringRef getArgument() const final { return "nsp-spmdize"; }
 
@@ -67,10 +75,7 @@ struct NSPSpmdizePass
     return "SPMD transformation for multi-NSP execution";
   }
 
-  Option<bool> allowCollectives{
-      *this, "allow-collectives",
-      llvm::cl::desc("Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
-      llvm::cl::init(false)};
+  Option<bool> allowCollectives;
 
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
