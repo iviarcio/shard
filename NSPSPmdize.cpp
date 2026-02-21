@@ -28,14 +28,17 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <iterator>
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 // Shard dialect ops/types.
@@ -54,7 +57,7 @@ struct NSPSpmdizePass
 
   NSPSpmdizePass() : NSPSpmdizePass(/*allowCollectives=*/false) {}
 
-  /// Programmatic construction used by createNSPSpmdizePass(bool).
+  /// Constructor used by createNSPSpmdizePass(bool).
   explicit NSPSpmdizePass(bool allow)
       : PassWrapper(),
         allowCollectives(
@@ -79,10 +82,13 @@ struct NSPSpmdizePass
 
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
+
     ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
+    ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
     ctx->getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<mlir::linalg::LinalgDialect>();
+    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
 
     ModuleOp module = getOperation();
@@ -264,21 +270,91 @@ struct NSPSpmdizePass
         // Bring-up path: reconstitute to the original global type so existing
         // bufferization.materialize_in_destination keeps working.
         Value replacement = newGeneric.getResult(0);
-        if (!allowCollectives.getValue()) {
-          g.emitError() << "NSPSpmdize: rewriting requires shard.all_gather but "
-                           "collectives are disabled";
+
+        if (allowCollectives) {
+          // Collective path: reconstitute a global tensor.
+          replacement = mlir::shard::AllGatherOp::create(
+                             b, loc, /*result=*/outResTy,
+                             /*grid=*/"nsp",
+                             /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
+                             /*input=*/replacement,
+                             /*gather_axis=*/splitAxisAP).getResult();
+
+          g.getResult(0).replaceAllUsesWith(replacement);
+          g.erase();
+          continue;
+        }
+
+        // Non-collective path:
+        // Store the local tile directly into a slice of the global destination buffer.
+        // Requires that the global consumer is a bufferization.materialize_in_destination op.
+        auto users = g.getResult(0).getUsers();
+        if (std::distance(users.begin(), users.end()) != 1) {
+          g.emitError() << "NSPSpmdize: non-collective mode requires a single "
+                           "consumer (bufferization.materialize_in_destination)";
           signalPassFailure();
           return;
         }
-        replacement = mlir::shard::AllGatherOp::create(
-                           b, loc, /*result=*/outResTy,
-                           /*grid=*/"nsp",
-                           /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
-                           /*input=*/replacement,
-                           /*gather_axis=*/splitAxisAP).getResult();
 
-        g.getResult(0).replaceAllUsesWith(replacement);
+        Operation *onlyUser = *users.begin();
+        auto mat = dyn_cast<mlir::bufferization::MaterializeInDestinationOp>(onlyUser);
+        if (!mat) {
+          g.emitError() << "NSPSpmdize: non-collective mode requires the result "
+                           "to be materialized via bufferization.materialize_in_destination";
+          signalPassFailure();
+          return;
+        }
+
+        // Expect the destination to be a 1D memref.
+        Value dest = mat->getOperand(1);
+        auto destTy = dyn_cast<mlir::MemRefType>(dest.getType());
+        if (!destTy || destTy.getRank() != 1) {
+          mat.emitError() << "NSPSpmdize: expected a 1D memref destination in "
+                             "bufferization.materialize_in_destination";
+          signalPassFailure();
+          return;
+        }
+
+        int64_t tileSize = localTy.getDimSize(0);
+        if (ShapedType::isDynamic(tileSize)) {
+          mat.emitError() << "NSPSpmdize: non-collective store-by-tile requires "
+                             "a static tile size";
+          signalPassFailure();
+          return;
+        }
+
+        // Insert offset/subview computation right before materialization.
+        b.setInsertionPoint(mat);
+
+        // procIdx is an index in [0, numShards).
+        Value procIdx = mlir::shard::ProcessLinearIndexOp::create(
+                            b, loc, /*grid=*/"nsp").getResult();
+
+        // offset = procIdx * tileSize
+        Value cTile = b.create<mlir::arith::ConstantIndexOp>(loc, tileSize);
+        Value offset = b.create<mlir::arith::MulIOp>(loc, procIdx, cTile);
+
+        Value cOne = b.create<mlir::arith::ConstantIndexOp>(loc, 1);
+        SmallVector<OpFoldResult> offsets = {offset};
+        SmallVector<OpFoldResult> sizes = {cTile};
+        SmallVector<OpFoldResult> strides = {cOne};
+
+        // Create a subview into the destination buffer corresponding to this
+        // process' tile.
+        auto subTy = mlir::MemRefType::get({tileSize}, destTy.getElementType(),
+                                           /*layout=*/{}, destTy.getMemorySpace());
+        Value destSubview =
+            b.create<mlir::memref::SubViewOp>(loc, subTy, dest, offsets, sizes,
+                                              strides);
+
+        // Rewrite the materialization to write only this tile into the
+        // corresponding destination slice.
+        mat->setOperand(0, replacement);
+        mat->setOperand(1, destSubview);
+
+        // The original global linalg.generic is now dead.
         g.erase();
+
       }
     });
   }
