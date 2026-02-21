@@ -206,10 +206,11 @@ struct NSPSpmdizePass
 
           // Allow shard.shard wrappers.
           if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(user)) {
-            if (shardOp.getInput() != cur)
+            // Be robust to ShardOp operand naming differences across versions.
+            if (shardOp->getNumOperands() < 1 || shardOp->getOperand(0) != cur)
               return std::nullopt;
             wrappers.push_back(user);
-            cur = shardOp.getResult();
+            cur = shardOp->getResult();
             continue;
           }
 
@@ -374,6 +375,7 @@ struct NSPSpmdizePass
           return;
         }
 
+        auto localResTy = dyn_cast<RankedTensorType>(localResult.getType());
         int64_t tileSize = localResTy.getDimSize(0);
         if (ShapedType::isDynamic(tileSize)) {
           mat.emitError() << "NSPSpmdize: store-by-tile requires a static tile size";
@@ -388,13 +390,12 @@ struct NSPSpmdizePass
         Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
 
         // offset = procIdx * tileSize
-        Value cTile = b.create<arith::ConstantIndexOp>(loc, tileSize);
-        Value offset = b.create<arith::MulIOp>(loc, procIdx, cTile);
+        Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
+        Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
 
-        Value cOne = b.create<arith::ConstantIndexOp>(loc, 1);
-        SmallVector<OpFoldResult> offsets = {offset};
-        SmallVector<OpFoldResult> sizes = {cTile};
-        SmallVector<OpFoldResult> strides = {cOne};
+        SmallVector<OpFoldResult> offsets = {offset};                  // dynamic offset
+        SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};  // static size
+        SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};       // static stride
 
         // Create a subview into the destination buffer corresponding to this
         // process' tile.
@@ -405,8 +406,8 @@ struct NSPSpmdizePass
             ArrayRef<int64_t>{tileSize}, destTy.getElementType(), subLayout,
             destTy.getMemorySpace());
 
-        Value destSubview = b.create<memref::SubViewOp>(
-            loc, subTy, dest, offsets, sizes, strides);
+        Value destSubview =
+            b.create<memref::SubViewOp>(loc, subTy, dest, offsets, sizes, strides);
 
         // Rewrite the materialization to store only this tile.
         mat->setOperand(0, localResult);
