@@ -341,8 +341,14 @@ struct NSPSpmdizePass
 
         // Create a subview into the destination buffer corresponding to this
         // process' tile.
-        auto subTy = mlir::MemRefType::get({tileSize}, destTy.getElementType(),
-                                           /*layout=*/{}, destTy.getMemorySpace());
+        auto subTy = mlir::MemRefType::get(
+            ArrayRef<int64_t>{tileSize},
+            destTy.getElementType(),
+            mlir::StridedLayoutAttr::get(destTy.getContext(),
+                                         /*offset=*/ShapedType::kDynamic,
+                                         /*strides=*/ArrayRef<int64_t>{1}),
+            destTy.getMemorySpace());
+
         Value destSubview =
             b.create<mlir::memref::SubViewOp>(loc, subTy, dest, offsets, sizes,
                                               strides);
