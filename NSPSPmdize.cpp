@@ -33,6 +33,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <iterator>
+#include <optional>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -40,6 +41,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+
+#include "mlir/IR/BuiltinAttributes.h"
 
 // Shard dialect ops/types.
 #include "mlir/Dialect/Shard/IR/ShardDialect.h"
@@ -146,10 +149,12 @@ struct NSPSpmdizePass
     //
     // The goal is to unblock end-to-end pipeline bring-up and validate the NSP
     // sharding annotations and parameter plumbing.
+
     const SmallVector<mlir::shard::GridAxis> gridAxes = {
         static_cast<mlir::shard::GridAxis>(0)};
     // Some Shard ops (e.g. all_gather) expect grid_axes as i16.
     const SmallVector<int16_t> gridAxesI16 = {static_cast<int16_t>(0)};
+
     const int64_t splitAxis = 0;
     const llvm::APInt splitAxisAP(/*numBits=*/64, /*val=*/splitAxis,
                                   /*isSigned=*/true);
@@ -173,9 +178,67 @@ struct NSPSpmdizePass
     module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
 
-      // Worklist since we'll rewrite in-place.
+      // Find a bufferization.materialize_in_destination sink for `v` while
+      // allowing a trivial chain of sharding wrappers.
+      //
+      // Sharding propagation often wraps values with shard.shard, so the IR can
+      // look like:
+      //   %r  = linalg.generic ... -> tensor<...>
+      //   %r1 = shard.shard %r to %sharding
+      //   bufferization.materialize_in_destination %r1 in %dst
+      //
+      // In store-by-tile mode, we rewrite the materialization to store the
+      // local tile into a subview of %dst, and erase the wrapper chain.
+      auto findMaterializeSink =
+          [&](Value v)
+              -> std::optional<std::pair<
+                  bufferization::MaterializeInDestinationOp,
+                  SmallVector<Operation *>>> {
+        SmallVector<Operation *> wrappers;
+        Value cur = v;
+
+        while (true) {
+          // Keep bring-up simple: require a single-use chain.
+          if (!cur.hasOneUse())
+            return std::nullopt;
+
+          Operation *user = *cur.getUsers().begin();
+
+          // Allow shard.shard wrappers.
+          if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(user)) {
+            if (shardOp.getInput() != cur)
+              return std::nullopt;
+            wrappers.push_back(user);
+            cur = shardOp.getResult();
+            continue;
+          }
+
+          // Allow an optional tensor.cast in between.
+          if (auto castOp = dyn_cast<tensor::CastOp>(user)) {
+            if (castOp.getSource() != cur)
+              return std::nullopt;
+            wrappers.push_back(user);
+            cur = castOp.getResult();
+            continue;
+          }
+
+          // Accept bufferization.materialize_in_destination.
+          if (auto mat =
+                  dyn_cast<bufferization::MaterializeInDestinationOp>(user)) {
+            if (mat->getOperand(0) != cur)
+              return std::nullopt;
+            return std::make_optional(std::make_pair(mat, wrappers));
+          }
+
+          return std::nullopt;
+        }
+      };
+
+      // Use a worklist since we'll rewrite in-place.
       SmallVector<mlir::linalg::GenericOp> worklist;
-      func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
+      func.walk([&](mlir::linalg::GenericOp g) {
+        worklist.push_back(g);
+      });
 
       for (mlir::linalg::GenericOp g : worklist) {
         // Pattern: elementwise 1D generic with identity maps.
@@ -237,15 +300,13 @@ struct NSPSpmdizePass
                            /*input=*/in0,
                            /*grid=*/"nsp",
                            /*gridAxes=*/gridAxes,
-                           /*sliceAxis=*/splitAxis)
-                           .getResult();
+                           /*sliceAxis=*/splitAxis).getResult();
         Value in1Local = mlir::shard::AllSliceOp::create(
                            b, loc, /*result_type=*/localTy,
                            /*input=*/in1,
                            /*grid=*/"nsp",
                            /*gridAxes=*/gridAxes,
-                           /*sliceAxis=*/splitAxis)
-                           .getResult();
+                           /*sliceAxis=*/splitAxis).getResult();
 
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
@@ -267,47 +328,45 @@ struct NSPSpmdizePass
         // Move the region body (elementwise computation) over.
         newGeneric.getRegion().takeBody(g.getRegion());
 
-        // Bring-up path: reconstitute to the original global type so existing
-        // bufferization.materialize_in_destination keeps working.
-        Value replacement = newGeneric.getResult(0);
+        // Materialization policy:
+        // -----------------------
+        // *allowCollectives=true reconstitute a global tensor via
+        // shard.all_gather and keep the existing destination materialization.
+        //
+        // *allowCollectives=false store the local tile directly into a
+        // subview of the global destination (store-by-tile), avoiding communication.
+
+        Value localResult = newGeneric.getResult(0);
 
         if (allowCollectives) {
-          // Collective path: reconstitute a global tensor.
-          replacement = mlir::shard::AllGatherOp::create(
-                             b, loc, /*result=*/outResTy,
-                             /*grid=*/"nsp",
-                             /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
-                             /*input=*/replacement,
-                             /*gather_axis=*/splitAxisAP).getResult();
-
-          g.getResult(0).replaceAllUsesWith(replacement);
+          Value globalResult = mlir::shard::AllGatherOp::create(
+              b, loc, /*result=*/outResTy,
+              /*grid=*/"nsp",
+              /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
+              /*input=*/localResult,
+              /*gather_axis=*/splitAxisAP).getResult();
+          g.getResult(0).replaceAllUsesWith(globalResult);
           g.erase();
           continue;
         }
 
-        // Non-collective path:
-        // Store the local tile directly into a slice of the global destination buffer.
-        // Requires that the global consumer is a bufferization.materialize_in_destination op.
-        auto users = g.getResult(0).getUsers();
-        if (std::distance(users.begin(), users.end()) != 1) {
-          g.emitError() << "NSPSpmdize: non-collective mode requires a single "
-                           "consumer (bufferization.materialize_in_destination)";
-          signalPassFailure();
-          return;
-        }
-
-        Operation *onlyUser = *users.begin();
-        auto mat = dyn_cast<mlir::bufferization::MaterializeInDestinationOp>(onlyUser);
-        if (!mat) {
+        // Non-collective path: the original global result must be materialized
+        // into a destination memref (possibly via shard.shard wrappers inserted
+        // by propagation).
+        auto sink = findMaterializeSink(g.getResult(0));
+        if (!sink) {
           g.emitError() << "NSPSpmdize: non-collective mode requires the result "
                            "to be materialized via bufferization.materialize_in_destination";
           signalPassFailure();
           return;
         }
 
-        // Expect the destination to be a 1D memref.
+        auto mat = sink->first;
+        auto &wrappers = sink->second;
+
+        // Destination must be a 1D memref.
         Value dest = mat->getOperand(1);
-        auto destTy = dyn_cast<mlir::MemRefType>(dest.getType());
+        auto destTy = dyn_cast<MemRefType>(dest.getType());
         if (!destTy || destTy.getRank() != 1) {
           mat.emitError() << "NSPSpmdize: expected a 1D memref destination in "
                              "bufferization.materialize_in_destination";
@@ -315,52 +374,50 @@ struct NSPSpmdizePass
           return;
         }
 
-        int64_t tileSize = localTy.getDimSize(0);
+        int64_t tileSize = localResTy.getDimSize(0);
         if (ShapedType::isDynamic(tileSize)) {
-          mat.emitError() << "NSPSpmdize: non-collective store-by-tile requires "
-                             "a static tile size";
+          mat.emitError() << "NSPSpmdize: store-by-tile requires a static tile size";
           signalPassFailure();
           return;
         }
 
-        // Insert offset/subview computation right before materialization.
+        // Insert offset/subview computation right before the materialization.
         b.setInsertionPoint(mat);
 
         // procIdx is an index in [0, numShards).
-        Value procIdx = mlir::shard::ProcessLinearIndexOp::create(
-                            b, loc, /*grid=*/"nsp").getResult();
+        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
 
         // offset = procIdx * tileSize
-        Value cTile = b.create<mlir::arith::ConstantIndexOp>(loc, tileSize);
-        Value offset = b.create<mlir::arith::MulIOp>(loc, procIdx, cTile);
+        Value cTile = b.create<arith::ConstantIndexOp>(loc, tileSize);
+        Value offset = b.create<arith::MulIOp>(loc, procIdx, cTile);
 
-        Value cOne = b.create<mlir::arith::ConstantIndexOp>(loc, 1);
+        Value cOne = b.create<arith::ConstantIndexOp>(loc, 1);
         SmallVector<OpFoldResult> offsets = {offset};
         SmallVector<OpFoldResult> sizes = {cTile};
         SmallVector<OpFoldResult> strides = {cOne};
 
         // Create a subview into the destination buffer corresponding to this
         // process' tile.
-        auto subTy = mlir::MemRefType::get(
-            ArrayRef<int64_t>{tileSize},
-            destTy.getElementType(),
-            mlir::StridedLayoutAttr::get(destTy.getContext(),
-                                         /*offset=*/ShapedType::kDynamic,
-                                         /*strides=*/ArrayRef<int64_t>{1}),
+        auto subLayout = StridedLayoutAttr::get(
+            destTy.getContext(), /*offset=*/ShapedType::kDynamic,
+            /*strides=*/ArrayRef<int64_t>{1});
+        auto subTy = MemRefType::get(
+            ArrayRef<int64_t>{tileSize}, destTy.getElementType(), subLayout,
             destTy.getMemorySpace());
 
-        Value destSubview =
-            b.create<mlir::memref::SubViewOp>(loc, subTy, dest, offsets, sizes,
-                                              strides);
+        Value destSubview = b.create<memref::SubViewOp>(
+            loc, subTy, dest, offsets, sizes, strides);
 
-        // Rewrite the materialization to write only this tile into the
-        // corresponding destination slice.
-        mat->setOperand(0, replacement);
+        // Rewrite the materialization to store only this tile.
+        mat->setOperand(0, localResult);
         mat->setOperand(1, destSubview);
 
-        // The original global linalg.generic is now dead.
-        g.erase();
+        // Wrapper chain is now dead; erase in reverse order.
+        for (Operation *op : llvm::reverse(wrappers))
+          op->erase();
 
+        // Erase the original global generic.
+        g.erase();
       }
     });
   }
