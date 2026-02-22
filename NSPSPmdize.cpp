@@ -31,6 +31,8 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 
 #include <iterator>
 #include <optional>
@@ -40,6 +42,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -92,6 +95,7 @@ struct NSPSpmdizePass
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<mlir::linalg::LinalgDialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
 
     ModuleOp module = getOperation();
@@ -124,6 +128,223 @@ struct NSPSpmdizePass
                          << numShards;
       signalPassFailure();
       return;
+    }
+
+    // HELPER for Loop distribution (no collectives).
+    //
+    // For kernels with DOALL loops, sharding the reduced dimension requires
+    // cross-shard reductions. In non-collective mode, the correct strategy is
+    // to distribute the OUTER loop (e.g. batch) across NSPs and keep inner
+    // vectors intact.
+    //
+    // We implement a simple cyclic distribution (block dist is a future work):
+    //   original: for i = lb .. ub step s
+    //   shard k : for i = lb + k*s .. ub step (s*numShards)
+    //
+    // This avoids any communication and preserves semantics for reductions
+    // within the loop body.
+
+    auto distributeScfForCyclic = [&](mlir::func::FuncOp func) -> LogicalResult {
+      OpBuilder b(func.getContext());
+      SmallVector<mlir::scf::ForOp> loops;
+      func.walk([&](mlir::scf::ForOp forOp) { loops.push_back(forOp); });
+
+      // Returns true iff `v` is derived from `iv` via a restricted set of
+      // affine-like integer/index ops. This is a conservative "taint" analysis
+      // used to detect whether the loop IV participates in output indexing.
+      auto reachesFromIv = [&](Value iv, Value v) -> bool {
+        if (v == iv)
+          return true;
+
+        // BFS over the def-use chain backwards (operand -> defining op -> its operands).
+        llvm::SmallVector<Value, 16> worklist;
+        llvm::SmallPtrSet<Value, 32> visited;
+        worklist.push_back(v);
+
+        auto enqueue = [&](Value x) {
+          if (!x)
+            return;
+          if (visited.insert(x).second)
+            worklist.push_back(x);
+        };
+
+        while (!worklist.empty()) {
+          Value cur = worklist.pop_back_val();
+          if (cur == iv)
+            return true;
+
+          Operation *def = cur.getDefiningOp();
+          if (!def)
+            continue;
+
+          // Allow common integer/index plumbing ops.
+          // This intentionally ignores complex control/dataflow.
+          if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp,
+                  arith::DivSIOp, arith::DivUIOp,
+                  arith::RemSIOp, arith::RemUIOp,
+                  arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
+                  arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+                  arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+                  arith::IndexCastOp, arith::IndexCastUIOp,
+                  arith::ConstantOp>(def)) {
+            for (Value opnd : def->getOperands())
+              enqueue(opnd);
+            continue;
+          }
+
+          // Allow memref.cast / view-like ops in the index path.
+          if (isa<memref::CastOp>(def)) {
+            for (Value opnd : def->getOperands())
+              enqueue(opnd);
+            continue;
+          }
+        }
+
+        return false;
+      };
+
+      // Returns true iff the loop appears to perform per-iteration output
+      // writes whose address depends on the IV, i.e. a DOALL-style tiled store.
+      auto shouldDistributeLoop = [&](mlir::scf::ForOp forOp) -> bool {
+        Value iv = forOp.getInductionVar();
+
+        bool foundIvIndexedStore = false;
+
+        // Direct memref.store with IV-derived indices.
+        forOp.walk([&](memref::StoreOp st) {
+          for (Value idx : st.getIndices()) {
+            if (reachesFromIv(iv, idx)) {
+              foundIvIndexedStore = true;
+              return WalkResult::interrupt();
+            }
+          }
+          return WalkResult::advance();
+        });
+        if (foundIvIndexedStore)
+          return true;
+
+        // bufferization.materialize_in_destination where dest is a subview
+        // with dynamic offset derived from IV. This matches patterns like:
+        //   %sv = memref.subview %dst[%off] ...
+        //   bufferization.materialize_in_destination %t, %sv
+        forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
+          Value dest = mat->getOperand(1);
+          // Strip trivial casts.
+          while (auto c = dest.getDefiningOp<memref::CastOp>())
+            dest = c.getSource();
+
+          auto sub = dest.getDefiningOp<memref::SubViewOp>();
+          if (!sub)
+            return WalkResult::advance();
+
+          // Check dynamic offsets (OpFoldResult==Values) and see if any
+          // reach the IV.
+          for (OpFoldResult ofr : sub.getMixedOffsets()) {
+            if (auto v = dyn_cast<Value>(ofr)) {
+              if (reachesFromIv(iv, v)) {
+                foundIvIndexedStore = true;
+                return WalkResult::interrupt();
+              }
+            }
+          }
+          return WalkResult::advance();
+        });
+
+        return foundIvIndexedStore;
+      };
+
+      for (mlir::scf::ForOp forOp : loops) {
+        // Bring-up constraints:
+        //  - no iter_args / no results
+        //  - induction var is index or an integer type with sufficient range
+        if (!forOp.getResults().empty() || !forOp.getInitArgs().empty())
+          continue;
+
+        // Only distribute loops that look DOALL and "tile-store" safe:
+        // the IV must participate in the output addressing (store/subview offset).
+        if (!shouldDistributeLoop(forOp))
+          continue;
+
+        Type ivTy = forOp.getInductionVar().getType();
+        bool ivIsIndex = ivTy.isa<IndexType>();
+        auto ivIntTy = dyn_cast<IntegerType>(ivTy);
+        if (!ivIsIndex && !ivIntTy)
+          continue;
+        if (ivIntTy && ivIntTy.getWidth() < 32) {
+          // Avoid silent overflow for small index types (e.g., i16).
+          forOp.emitRemark()
+              << "NSPSpmdize: skipping scf.for distribution for small integer IV type "
+              << ivTy;
+          continue;
+        }
+
+        Value lb = forOp.getLowerBound();
+        Value ub = forOp.getUpperBound();
+        Value step = forOp.getStep();
+
+        // Require bounds/step to match the IV type to keep the transformation simple.
+        if (lb.getType() != ivTy || ub.getType() != ivTy || step.getType() != ivTy)
+          continue;
+
+        Location loc = forOp.getLoc();
+        b.setInsertionPoint(forOp);
+
+        // procIdx: index in [0, numShards)
+        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        // Cast procIdx to the IV type (index stays index; integer gets index_cast).
+        Value procInIvTy = procIdx;
+        if (!ivIsIndex)
+          procInIvTy = b.create<arith::IndexCastOp>(loc, ivTy, procIdx);
+
+        // newLb = lb + procI32 * step
+        Value offset = b.create<arith::MulIOp>(loc, procInIvTy, step);
+        Value newLb = b.create<arith::AddIOp>(loc, lb, offset);
+
+        // newStep = step * numShards
+        Value cNum = ivIsIndex
+                         ? static_cast<Value>(b.create<arith::ConstantIndexOp>(loc, numShards))
+                         : static_cast<Value>(b.create<arith::ConstantIntOp>(loc, numShards, ivIntTy));
+        Value newStep = b.create<arith::MulIOp>(loc, step, cNum);
+
+        // Create the distributed loop.
+        auto newFor = b.create<mlir::scf::ForOp>(loc, newLb, ub, newStep);
+
+        // Clone the body operations, remapping the induction variable.
+        Block *oldBody = forOp.getBody();
+        Block *newBody = newFor.getBody();
+
+        // Remove the default terminator inserted by builder.
+        newBody->getOperations().clear();
+
+        IRMapping mapping;
+        mapping.map(forOp.getInductionVar(), newFor.getInductionVar());
+
+        for (Operation &op : oldBody->without_terminator()) {
+          b.setInsertionPointToEnd(newBody);
+          b.clone(op, mapping);
+        }
+        b.setInsertionPointToEnd(newBody);
+        b.create<mlir::scf::YieldOp>(loc);
+
+        // Replace uses of the old loop results (none here) and erase old loop.
+        forOp.erase();
+      }
+      return success();
+    };
+
+    if (!allowCollectives) {
+      // In non-collective mode, prioritize loop distribution. This is the
+      // required strategy for patterns with intra-tile reductions (e.g. softmax).
+      module.walk([&](mlir::func::FuncOp func) {
+        if (failed(distributeScfForCyclic(func))) {
+          signalPassFailure();
+          return;
+        }
+      });
+
+      // TODO: loop distribution is the key step for softmax correctness
+      // without collectives.
+
     }
 
     // Optionally sanity-check that we have some sharding descriptors.
@@ -210,7 +431,7 @@ struct NSPSpmdizePass
             if (shardOp->getNumOperands() < 1 || shardOp->getOperand(0) != cur)
               return std::nullopt;
             wrappers.push_back(user);
-            cur = shardOp->getResult();
+            cur = shardOp->getResult(0);
             continue;
           }
 
@@ -356,10 +577,11 @@ struct NSPSpmdizePass
         // by propagation).
         auto sink = findMaterializeSink(g.getResult(0));
         if (!sink) {
-          g.emitError() << "NSPSpmdize: non-collective mode requires the result "
-                           "to be materialized via bufferization.materialize_in_destination";
-          signalPassFailure();
-          return;
+          // In non-collective mode, only finalize ops that directly materialize to a
+          // destination memref. Intermediate tensors must remain in SSA form until the final sink.
+          // g.emitRemark() << "NSPSpmdize: non-collective mode skipping rewrite for an "
+          //                   "intermediate elementwise op (no materialize_in_destination sink)";
+          continue;
         }
 
         auto mat = sink->first;
