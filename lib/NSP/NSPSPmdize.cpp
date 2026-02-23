@@ -520,6 +520,22 @@ struct NSPSpmdizePass
         Location loc = g.getLoc();
         b.setInsertionPoint(g);
 
+        // Non-collective path must ONLY rewrite ops that directly materialize
+        // into a destination memref. Intermediate elementwise ops (common in
+        // pipelines like softmax) must remain intact; otherwise, moving the
+        // region body (takeBody) would leave the original op with an empty
+        // region and trigger verifier errors.
+        std::optional<std::pair<bufferization::MaterializeInDestinationOp,
+                                SmallVector<Operation *>>>
+            sink;
+        if (!allowCollectives) {
+          sink = findMaterializeSink(g.getResult(0));
+          if (!sink) {
+            // No materialization sink => this is an intermediate tensor.
+            continue;
+          }
+        }
+
         // Slice inputs into per-core tiles.
         Value in0Local = mlir::shard::AllSliceOp::create(
                            b, loc, /*result_type=*/localTy,
@@ -576,18 +592,7 @@ struct NSPSpmdizePass
           continue;
         }
 
-        // Non-collective path: the original global result must be materialized
-        // into a destination memref (possibly via shard.shard wrappers inserted
-        // by propagation).
-        auto sink = findMaterializeSink(g.getResult(0));
-        if (!sink) {
-          // In non-collective mode, only finalize ops that directly materialize to a
-          // destination memref. Intermediate tensors must remain in SSA form until the final sink.
-          // g.emitRemark() << "NSPSpmdize: non-collective mode skipping rewrite for an "
-          //                   "intermediate elementwise op (no materialize_in_destination sink)";
-          continue;
-        }
-
+        // Non-collective path: use the previously found materialization sink.
         auto mat = sink->first;
         auto &wrappers = sink->second;
 
