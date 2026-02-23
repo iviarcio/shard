@@ -265,11 +265,13 @@ struct NSPSpmdizePass
         if (!shouldDistributeLoop(forOp))
           continue;
 
-        Type ivTy = forOp.getInductionVar().getType();
-        bool ivIsIndex = ivTy.isa<IndexType>();
-        auto ivIntTy = dyn_cast<IntegerType>(ivTy);
+        mlir::Type ivTy = forOp.getInductionVar().getType();
+        bool ivIsIndex = mlir::isa<mlir::IndexType>(ivTy);
+        auto ivIntTy = mlir::dyn_cast<mlir::IntegerType>(ivTy);
+
         if (!ivIsIndex && !ivIntTy)
           continue;
+
         if (ivIntTy && ivIntTy.getWidth() < 32) {
           // Avoid silent overflow for small index types (e.g., i16).
           forOp.emitRemark()
@@ -303,7 +305,9 @@ struct NSPSpmdizePass
         // newStep = step * numShards
         Value cNum = ivIsIndex
                          ? static_cast<Value>(b.create<arith::ConstantIndexOp>(loc, numShards))
-                         : static_cast<Value>(b.create<arith::ConstantIntOp>(loc, numShards, ivIntTy));
+                         : static_cast<Value>(b.create<arith::ConstantIntOp>(
+                               loc, numShards, ivIntTy.getWidth()));
+
         Value newStep = b.create<arith::MulIOp>(loc, step, cNum);
 
         // Create the distributed loop.
