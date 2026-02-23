@@ -1,5 +1,10 @@
 //===- Passes.h - Convert Shard to LLVM ops ---------------------*- C++ -*-===//
 //
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause.
+// For more license information:
+//   https://github.com/qualcomm/hexagon-mlir/LICENSE.txt
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef HEXAGON_CONVERSION_SHARDTOLLVM_PASSES_H

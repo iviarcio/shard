@@ -1,7 +1,14 @@
 //===- ShardToLLVMPass.cpp - Lower shard ops to arith/tensor ---------------===//
 //
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: BSD-3-Clause.
+// For more license information:
+//   https://github.com/qualcomm/hexagon-mlir/LICENSE.txt
+//
+//===----------------------------------------------------------------------===//
+//
 // PoC pass for lowering shard dialect ops produced by NSP sharding/materialization.
-// This pass is intentionally narrow: it targets the exact shard ops used by vadd.mlir
+// This pass is intentionally narrow: it targets the exact shard ops used by vadd
 // (shard.sharding, shard.shard, shard.process_linear_index, shard.all_slice) and
 // rewrites them into standard MLIR (arith/tensor) so the existing linalg-to-llvm
 // pipeline can finish the lowering.
