@@ -40,30 +40,64 @@ using namespace mlir;
 
 namespace {
 
+// Pick linear-index components by fixed offsets from the last function arg.
+// Right-to-left (last -> first): [0], cid, tid, [1], num_cores, ntpc, ...
+//
+// Therefore, with last = args[N-1]:
+//   cid  = args[N-2]
+//   tid  = args[N-3]
+//   ntpc = args[N-6]
+//===----------------------------------------------------------------------===//
+
+struct LinearIdxABI {
+  Value cid;
+  Value tid;
+  Value ntpc;
+  Value numCores; // optional
+};
+
+static Value castToIndexIfNeeded(Value v, OpBuilder &b, Location loc) {
+  if (v.getType().isIndex())
+    return v;
+  if (isa<IntegerType>(v.getType()))
+    return b.create<arith::IndexCastOp>(loc, b.getIndexType(), v);
+  return Value(); // Unexpected type.
+}
+
+static FailureOr<LinearIdxABI> resolveLinearIdxABIFromTail(func::FuncOp func) {
+  auto args = func.getArguments();
+  int64_t n = (int64_t)args.size();
+
+  // Need at least 6 tail slots to access ntpc at N-6.
+  if (n < 6)
+    return failure();
+
+  LinearIdxABI abi;
+  abi.cid     = args[n - 2];
+  abi.tid     = args[n - 3];
+  abi.numCores= args[n - 5]; // not required for linearIdx, but kept for future use
+  abi.ntpc    = args[n - 6];
+
+  return abi;
+}
+
 /// Compute linear process id:
 ///   linearIdx = coreId * numThreadsPerCore + threadId
-static Value computeLinearIdxFromFuncArgs(func::FuncOp func,
-                                         int ntpcArg,
-                                         int tidArg,
-                                         int cidArg,
-                                         OpBuilder &b,
-                                         Location loc) {
-  auto args = func.getArguments();
-  assert(ntpcArg >= 0 && ntpcArg < (int)args.size());
-  assert(tidArg  >= 0 && tidArg  < (int)args.size());
-  assert(cidArg  >= 0 && cidArg  < (int)args.size());
+static FailureOr<Value> computeLinearIdxFromFuncArgs(
+       func::FuncOp func, OpBuilder &b, Location loc) {
 
-  Value ntpc = args[ntpcArg];
-  Value tid  = args[tidArg];
-  Value cid  = args[cidArg];
+  auto abiOrFail = resolveLinearIdxABIFromTail(func);
+  if (failed(abiOrFail))
+    return failure();
 
-  // All are expected to be index-typed in the PoC.
-  if (!ntpc.getType().isIndex())
-    ntpc = b.create<arith::IndexCastOp>(loc, b.getIndexType(), ntpc);
-  if (!tid.getType().isIndex())
-    tid  = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tid);
-  if (!cid.getType().isIndex())
-    cid  = b.create<arith::IndexCastOp>(loc, b.getIndexType(), cid);
+  LinearIdxABI abi = *abiOrFail;
+
+  Value cid  = castToIndexIfNeeded(abi.cid, b, loc);
+  Value tid  = castToIndexIfNeeded(abi.tid, b, loc);
+  Value ntpc = castToIndexIfNeeded(abi.ntpc, b, loc);
+
+  if (!cid || !tid || !ntpc)
+    return failure();
 
   Value mul = b.create<arith::MulIOp>(loc, cid, ntpc);
   Value add = b.create<arith::AddIOp>(loc, mul, tid);
@@ -74,8 +108,8 @@ static Value computeLinearIdxFromFuncArgs(func::FuncOp func,
 /// This is redundant if shard.all_slice lowering also recomputes linearIdx,
 /// but it helps eliminate all shard ops for debugging.
 struct LowerProcessLinearIndex final : public OpRewritePattern<Operation> {
-  LowerProcessLinearIndex(MLIRContext *ctx, int ntpcArg, int tidArg, int cidArg)
-      : OpRewritePattern(ctx), ntpcArg(ntpcArg), tidArg(tidArg), cidArg(cidArg) {}
+  LowerProcessLinearIndex(MLIRContext *ctx)
+      : OpRewritePattern(ctx){}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
@@ -87,22 +121,22 @@ struct LowerProcessLinearIndex final : public OpRewritePattern<Operation> {
     if (!func)
       return failure();
 
-    Value linearIdx =
-        computeLinearIdxFromFuncArgs(func, ntpcArg, tidArg, cidArg, rewriter, op->getLoc());
-
+    auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, rewriter, loc);
+    if (failed(linearIdxOrFail))
+      return failure();
+    Value linearIdx = *linearIdxOrFail;
     rewriter.replaceOp(op, linearIdx);
     return success();
   }
 
-  int ntpcArg, tidArg, cidArg;
 };
 
 /// Lower shard.all_slice(%tensor, %sharding {grid_axes=[...], slice_axis=i})
 /// into tensor.extract_slice, with offset computed from linearIdx.
 /// PoC supports only ranked 1-D tensors with static slice size.
 struct LowerAllSlice final : public OpRewritePattern<Operation> {
-  LowerAllSlice(MLIRContext *ctx, int ntpcArg, int tidArg, int cidArg)
-      : OpRewritePattern(ctx), ntpcArg(ntpcArg), tidArg(tidArg), cidArg(cidArg) {}
+  LowerAllSlice(MLIRContext *ctx)
+      : OpRewritePattern(ctx){}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
@@ -132,8 +166,10 @@ struct LowerAllSlice final : public OpRewritePattern<Operation> {
 
     Location loc = op->getLoc();
 
-    Value linearIdx =
-        computeLinearIdxFromFuncArgs(func, ntpcArg, tidArg, cidArg, rewriter, loc);
+    auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, rewriter, loc);
+    if (failed(linearIdxOrFail))
+      return failure();
+    Value linearIdx = *linearIdxOrFail;
 
     // offset = linearIdx * sliceSize
     Value sliceSizeVal =
@@ -154,7 +190,6 @@ struct LowerAllSlice final : public OpRewritePattern<Operation> {
     return success();
   }
 
-  int ntpcArg, tidArg, cidArg;
 };
 
 /// shard.shard is treated as an annotation carrier in this PoC.
@@ -214,8 +249,8 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
 
     RewritePatternSet patterns(ctx);
     patterns.add<LowerShardOp, EraseDeadShardingValue>(ctx);
-    patterns.add<LowerProcessLinearIndex>(ctx, numThreadsPerCoreArgIndex, threadIdArgIndex, coreIdArgIndex);
-    patterns.add<LowerAllSlice>(ctx, numThreadsPerCoreArgIndex, threadIdArgIndex, coreIdArgIndex);
+    patterns.add<LowerProcessLinearIndex>(ctx);
+    patterns.add<LowerAllSlice>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
