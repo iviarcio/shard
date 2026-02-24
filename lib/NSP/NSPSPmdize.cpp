@@ -130,6 +130,52 @@ struct NSPSpmdizePass
       return;
     }
 
+    // HELPER for strip shard tensor annotations inside loops that were explicitly
+    // distributed by this pass (marked with 'nsp.distributed').
+    //
+    // Rationale:
+    // In non-collective mode, the SPMD partitioning is expressed by the loop
+    // schedule (lb/step adjusted using shard.process_linear_index). Any
+    // shard.shard/shard.sharding inside such loops becomes stale metadata and
+    // may confuse later lowerings (e.g., ShardToLLVM).
+    //
+    // We keep shard.grid and shard.process_linear_index, and we do NOT touch
+    // shard annotations outside distributed loops.
+    auto stripShardAnnotationsInDistributedLoops =
+        [&](mlir::func::FuncOp func) {
+          SmallVector<Operation *> eraseList;
+
+          func.walk([&](mlir::scf::ForOp forOp) {
+            if (!forOp->hasAttr("nsp.distributed"))
+              return;
+
+            Block *body = forOp.getBody();
+
+            // 1: Replace and erase shard.shard wrappers inside the loop body.
+            body->walk([&](mlir::shard::ShardOp op) {
+              // shard.shard is a value wrapper: replace result with input.
+              if (op->getNumOperands() < 1 || op->getNumResults() < 1)
+                return;
+              Value wrapped = op->getOperand(0);
+              Value res = op->getResult(0);
+              res.replaceAllUsesWith(wrapped);
+              eraseList.push_back(op);
+            });
+
+            // 2: Erase shard.sharding descriptors inside the loop body if unused.
+            // These usually become dead after removing shard.shard wrappers.
+            body->walk([&](mlir::shard::ShardingOp op) {
+              if (op->getNumResults() != 1)
+                return;
+              if (op->getResult(0).use_empty())
+                eraseList.push_back(op);
+            });
+          });
+
+          for (Operation *op : eraseList)
+            op->erase();
+        };
+
     // HELPER for Loop distribution (no collectives).
     //
     // For kernels with DOALL loops, sharding the reduced dimension requires
@@ -328,6 +374,9 @@ struct NSPSpmdizePass
 
         // Create the distributed loop.
         auto newFor = b.create<mlir::scf::ForOp>(loc, newLb, ub, newStep);
+        // Mark this loop so we can precisely clean up stale shard annotations
+        // only within distributed loops (non-collective mode).
+        newFor->setAttr("nsp.distributed", b.getUnitAttr());
 
         // Clone the body operations, remapping the induction variable.
         Block *oldBody = forOp.getBody();
@@ -362,8 +411,12 @@ struct NSPSpmdizePass
         }
       });
 
-      // TODO: loop distribution is the key step for softmax correctness
-      // without collectives.
+      // After distribution, strip shard tensor annotations only inside
+      // distributed loops. Outside those loops, sharding metadata (if any)
+      // is preserved.
+      module.walk([&](mlir::func::FuncOp func) {
+        stripShardAnnotationsInDistributedLoops(func);
+      });
 
     }
 
@@ -686,4 +739,3 @@ std::unique_ptr<Pass> createNSPSpmdizePass(bool allowCollectives) {
 
 } // namespace hexagon
 } // namespace mlir
-
