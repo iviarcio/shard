@@ -223,30 +223,46 @@ struct NSPSpmdizePass
         if (foundIvIndexedStore)
           return true;
 
-        // bufferization.materialize_in_destination where dest is a subview
-        // with dynamic offset derived from IV. This matches patterns like:
+        // bufferization.materialize_in_destination where dest is a view into the
+        // output buffer whose dynamic offset is derived from the IV.
+        // This matches patterns like:
         //   %sv = memref.subview %dst[%off] ...
         //   bufferization.materialize_in_destination %t, %sv
+        // as well as:
+        //   %rc = memref.reinterpret_cast %dst to offset: [%off], sizes: [...]
+        //   bufferization.materialize_in_destination %t, %rc
         forOp.walk([&](bufferization::MaterializeInDestinationOp mat) {
           Value dest = mat->getOperand(1);
+
           // Strip trivial casts.
           while (auto c = dest.getDefiningOp<memref::CastOp>())
             dest = c.getSource();
 
-          auto sub = dest.getDefiningOp<memref::SubViewOp>();
-          if (!sub)
+          // Case 1: memref.subview with dynamic offsets.
+          if (auto sub = dest.getDefiningOp<memref::SubViewOp>()) {
+            for (OpFoldResult ofr : sub.getMixedOffsets()) {
+              if (auto v = dyn_cast<Value>(ofr)) {
+                if (reachesFromIv(iv, v)) {
+                  foundIvIndexedStore = true;
+                  return WalkResult::interrupt();
+                }
+              }
+            }
             return WalkResult::advance();
+          }
 
-          // Check dynamic offsets (OpFoldResult==Values) and see if any
-          // reach the IV.
-          for (OpFoldResult ofr : sub.getMixedOffsets()) {
-            if (auto v = dyn_cast<Value>(ofr)) {
-              if (reachesFromIv(iv, v)) {
+          // Case 2: memref.reinterpret_cast with dynamic offset/sizes/strides.
+          if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
+            // Operands: source, offset, sizes..., strides...
+            // Conservatively check all dynamic operands except the source.
+            for (unsigned oi = 1, oe = rc->getNumOperands(); oi < oe; ++oi) {
+              if (reachesFromIv(iv, rc->getOperand(oi))) {
                 foundIvIndexedStore = true;
                 return WalkResult::interrupt();
               }
             }
           }
+
           return WalkResult::advance();
         });
 
