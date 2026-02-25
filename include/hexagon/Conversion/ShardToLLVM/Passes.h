@@ -10,11 +10,15 @@
 #ifndef HEXAGON_CONVERSION_SHARDTOLLVM_PASSES_H
 #define HEXAGON_CONVERSION_SHARDTOLLVM_PASSES_H
 
-#include "hexagon/Conversion/ShardToLLVM/ShardToLLVM.h"
+#include "mlir/Pass/Pass.h"
 
 namespace mlir {
 namespace hexagon {
 
+/// Create the ShardToLLVM conversion pass.
+std::unique_ptr<Pass> createShardToLLVMPass();
+
+/// Register ShardToLLVM passes.
 #define GEN_PASS_REGISTRATION
 #include "hexagon/Conversion/ShardToLLVM/Passes.h.inc"
 
