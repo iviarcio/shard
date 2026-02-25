@@ -11,6 +11,7 @@
 #define HEXAGON_CONVERSION_SHARDTOLLVM_PASSES_H
 
 #include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 
 namespace mlir {
 namespace hexagon {

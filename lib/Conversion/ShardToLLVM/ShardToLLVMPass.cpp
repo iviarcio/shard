@@ -85,7 +85,6 @@ static FailureOr<LinearIdxABI> resolveLinearIdxABIFromTail(func::FuncOp func) {
 ///   linearIdx = coreId * numThreadsPerCore + threadId
 static FailureOr<Value> computeLinearIdxFromFuncArgs(
        func::FuncOp func, OpBuilder &b, Location loc) {
-
   auto abiOrFail = resolveLinearIdxABIFromTail(func);
   if (failed(abiOrFail))
     return failure();
@@ -104,26 +103,23 @@ static FailureOr<Value> computeLinearIdxFromFuncArgs(
   return add;
 }
 
-/// Lower shard.process_linear_index(...) to the arith expression above.
-/// This is redundant if shard.all_slice lowering also recomputes linearIdx,
-/// but it helps eliminate all shard ops for debugging.
-struct LowerProcessLinearIndex final : public OpRewritePattern<Operation> {
-  LowerProcessLinearIndex(MLIRContext *ctx)
-      : OpRewritePattern(ctx){}
-
+/// Lower shard.process_linear_index to:
+///   linearIdx = cid * ntpc + tid
+struct LowerProcessLinearIndex final : public RewritePattern {
+  explicit LowerProcessLinearIndex(MLIRContext *ctx)
+      : RewritePattern("shard.process_linear_index", /*benefit=*/1, ctx) {}
+ 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    // Avoid depending on exact C++ op API if it changes; just match by name.
-    if (op->getName().getStringRef() != "shard.process_linear_index")
-      return failure();
-
     auto func = op->getParentOfType<func::FuncOp>();
     if (!func)
       return failure();
 
+    Location loc = op->getLoc();
     auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, rewriter, loc);
     if (failed(linearIdxOrFail))
       return failure();
+
     Value linearIdx = *linearIdxOrFail;
     rewriter.replaceOp(op, linearIdx);
     return success();
@@ -134,15 +130,12 @@ struct LowerProcessLinearIndex final : public OpRewritePattern<Operation> {
 /// Lower shard.all_slice(%tensor, %sharding {grid_axes=[...], slice_axis=i})
 /// into tensor.extract_slice, with offset computed from linearIdx.
 /// PoC supports only ranked 1-D tensors with static slice size.
-struct LowerAllSlice final : public OpRewritePattern<Operation> {
-  LowerAllSlice(MLIRContext *ctx)
-      : OpRewritePattern(ctx){}
+struct LowerAllSlice final : public RewritePattern {
+  explicit LowerAllSlice(MLIRContext *ctx)
+      : RewritePattern("shard.all_slice", /*benefit=*/1, ctx) {}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (op->getName().getStringRef() != "shard.all_slice")
-      return failure();
-
     if (op->getNumOperands() < 1 || op->getNumResults() != 1)
       return failure();
 
@@ -169,6 +162,7 @@ struct LowerAllSlice final : public OpRewritePattern<Operation> {
     auto linearIdxOrFail = computeLinearIdxFromFuncArgs(func, rewriter, loc);
     if (failed(linearIdxOrFail))
       return failure();
+
     Value linearIdx = *linearIdxOrFail;
 
     // offset = linearIdx * sliceSize
@@ -194,14 +188,12 @@ struct LowerAllSlice final : public OpRewritePattern<Operation> {
 
 /// shard.shard is treated as an annotation carrier in this PoC.
 /// Replace it by its input value.
-struct LowerShardOp final : public OpRewritePattern<Operation> {
-  using OpRewritePattern::OpRewritePattern;
+struct LowerShardOp final : public RewritePattern {
+  explicit LowerShardOp(MLIRContext *ctx)
+      : RewritePattern("shard.shard", /*benefit=*/1, ctx) {}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (op->getName().getStringRef() != "shard.shard")
-      return failure();
-
     if (op->getNumOperands() != 1 || op->getNumResults() != 1)
       return failure();
 
@@ -212,14 +204,12 @@ struct LowerShardOp final : public OpRewritePattern<Operation> {
 
 /// shard.sharding produces a !shard.sharding value used only by shard.shard / all_slice.
 /// After lowering, it should become dead. Erase if unused.
-struct EraseDeadShardingValue final : public OpRewritePattern<Operation> {
-  using OpRewritePattern::OpRewritePattern;
+struct EraseDeadShardingValue final : public RewritePattern {
+  explicit EraseDeadShardingValue(MLIRContext *ctx)
+      : RewritePattern("shard.sharding", /*benefit=*/1, ctx) {}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (op->getName().getStringRef() != "shard.sharding")
-      return failure();
-
     if (op->getNumResults() != 1)
       return failure();
 
@@ -235,7 +225,8 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
   using Base::Base;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, tensor::TensorDialect, func::FuncDialect, shard::ShardDialect>();
+    registry.insert<arith::ArithDialect, tensor::TensorDialect,
+                    func::FuncDialect, shard::ShardDialect>();
   }
 
   void runOnOperation() override {
@@ -245,7 +236,10 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     ConversionTarget target(*ctx);
     target.addIllegalDialect<shard::ShardDialect>();
     target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect, func::FuncDialect>();
-    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+    // Everything is legal unless it belongs to the 'shard' namespace.
+    target.markUnknownOpDynamicallyLegal([](Operation *op) {
+      return op->getName().getDialectNamespace() != StringRef("shard");
+    });
 
     RewritePatternSet patterns(ctx);
     patterns.add<LowerShardOp, EraseDeadShardingValue>(ctx);
