@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// PoC pass for lowering shard dialect ops produced by NSP sharding/materialization.
+// Pass for lowering shard dialect ops produced by NSP sharding/materialization.
 // This pass is intentionally narrow: it targets the exact shard ops used by vadd
 // (shard.sharding, shard.shard, shard.process_linear_index, shard.all_slice) and
 // rewrites them into standard MLIR (arith/tensor) so the existing linalg-to-llvm
@@ -103,8 +103,7 @@ static FailureOr<Value> computeLinearIdxFromFuncArgs(
   return add;
 }
 
-/// Lower shard.process_linear_index to:
-///   linearIdx = cid * ntpc + tid
+/// Lower shard.process_linear_index to: linearIdx = cid * ntpc + tid
 struct LowerProcessLinearIndex final : public RewritePattern {
   explicit LowerProcessLinearIndex(MLIRContext *ctx)
       : RewritePattern("shard.process_linear_index", /*benefit=*/1, ctx) {}
@@ -129,7 +128,7 @@ struct LowerProcessLinearIndex final : public RewritePattern {
 
 /// Lower shard.all_slice(%tensor, %sharding {grid_axes=[...], slice_axis=i})
 /// into tensor.extract_slice, with offset computed from linearIdx.
-/// PoC supports only ranked 1-D tensors with static slice size.
+/// We support only ranked 1-D tensors with static slice size.
 struct LowerAllSlice final : public RewritePattern {
   explicit LowerAllSlice(MLIRContext *ctx)
       : RewritePattern("shard.all_slice", /*benefit=*/1, ctx) {}
@@ -144,11 +143,11 @@ struct LowerAllSlice final : public RewritePattern {
     if (!resultTy || !inputTy)
       return failure();
 
-    // PoC: only 1-D tensor slicing.
+    // Only 1-D tensor slicing.
     if (resultTy.getRank() != 1 || inputTy.getRank() != 1)
       return failure();
 
-    // PoC: static size.
+    // Only static size.
     int64_t sliceSize = resultTy.getShape()[0];
     if (sliceSize <= 0)
       return failure();
@@ -186,8 +185,7 @@ struct LowerAllSlice final : public RewritePattern {
 
 };
 
-/// shard.shard is treated as an annotation carrier in this PoC.
-/// Replace it by its input value.
+/// shard.shard is treated as an annotation carrier. Replace it by its input value.
 struct LowerShardOp final : public RewritePattern {
   explicit LowerShardOp(MLIRContext *ctx)
       : RewritePattern("shard.shard", /*benefit=*/1, ctx) {}
@@ -202,7 +200,7 @@ struct LowerShardOp final : public RewritePattern {
   }
 };
 
-/// shard.sharding produces a !shard.sharding value used only by shard.shard / all_slice.
+/// shard.sharding produces a !shard.sharding value used only by shard.shard/all_slice.
 /// After lowering, it should become dead. Erase if unused.
 struct EraseDeadShardingValue final : public RewritePattern {
   explicit EraseDeadShardingValue(MLIRContext *ctx)
@@ -215,6 +213,23 @@ struct EraseDeadShardingValue final : public RewritePattern {
 
     if (!op->getResult(0).use_empty())
       return failure();
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// shard.grid is treated as metadata. If its result is unused after lowering, erase it.
+struct EraseDeadGrid final : public RewritePattern {
+  explicit EraseDeadGrid(MLIRContext *ctx)
+      : RewritePattern("shard.grid", /*benefit=*/1, ctx) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    // Commonly shard.grid returns a !shard.grid value; be conservative.
+    for (Value r : op->getResults())
+      if (!r.use_empty())
+        return failure();
 
     rewriter.eraseOp(op);
     return success();
@@ -245,6 +260,7 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     patterns.add<LowerShardOp, EraseDeadShardingValue>(ctx);
     patterns.add<LowerProcessLinearIndex>(ctx);
     patterns.add<LowerAllSlice>(ctx);
+    patterns.add<EraseDeadGrid>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
