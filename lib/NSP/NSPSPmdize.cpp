@@ -84,6 +84,8 @@ struct NSPSpmdizePass
     return "SPMD transformation for multi-NSP execution";
   }
 
+  // When enabled, this pass is allowed to materialize collectives (e.g.
+  // shard.all_gather) as part of the bring-up SPMDization.
   Option<bool> allowCollectives;
 
   void runOnOperation() final {
@@ -99,9 +101,6 @@ struct NSPSpmdizePass
     ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
 
     ModuleOp module = getOperation();
-
-    // When enabled, this pass is allowed to materialize collectives (e.g.
-    // shard.all_gather) as part of the bring-up SPMDization.
 
     // Validate that the expected grid symbol exists.
     // The planner currently creates shard.grid @nsp.
@@ -122,6 +121,7 @@ struct NSPSpmdizePass
       signalPassFailure();
       return;
     }
+
     const int64_t numShards = shape.front();
     if (numShards <= 0) {
       module.emitError() << "invalid shard grid size (shape[0]) = "
@@ -400,6 +400,10 @@ struct NSPSpmdizePass
       }
       return success();
     };
+
+    // ---------
+    // Main Body
+    // ---------
 
     if (!allowCollectives) {
       // In non-collective mode, prioritize loop distribution. This is the

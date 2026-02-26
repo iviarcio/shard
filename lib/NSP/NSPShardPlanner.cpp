@@ -121,7 +121,7 @@ struct NSPShardPlannerPass
 
   // Short help text for --list-passes and --help.
   StringRef getDescription() const override {
-    return "Plan Shard dialect annotations for NSP multi-NPU pre-tiling";
+    return "Plan Shard dialect annotations for multi-NSP (pre-tiling)";
   }
 
   NSPShardPlannerPass() = default;
