@@ -20,6 +20,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -119,8 +120,7 @@ struct LowerProcessLinearIndex final : public RewritePattern {
     if (failed(linearIdxOrFail))
       return failure();
 
-    Value linearIdx = *linearIdxOrFail;
-    rewriter.replaceOp(op, linearIdx);
+    rewriter.replaceOp(op, *linearIdxOrFail);
     return success();
   }
 
@@ -185,14 +185,18 @@ struct LowerAllSlice final : public RewritePattern {
 
 };
 
-/// shard.shard is treated as an annotation carrier. Replace it by its input value.
+/// shard.shard is treated as an annotation carrier. Replace it by
+/// its tensor operand (operand 0), ignoring the sharding metadata.
 struct LowerShardOp final : public RewritePattern {
   explicit LowerShardOp(MLIRContext *ctx)
       : RewritePattern("shard.shard", /*benefit=*/1, ctx) {}
 
+
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+    // shard.shard %tensor to %sharding ...
+    // Some pipelines may also produce shard.shard with extra operands/attrs.
+    if (op->getNumOperands() < 1 || op->getNumResults() != 1)
       return failure();
 
     rewriter.replaceOp(op, op->getOperand(0));
@@ -219,18 +223,17 @@ struct EraseDeadShardingValue final : public RewritePattern {
   }
 };
 
-// shard.grid is treated as metadata. If its result is unused after lowering, erase it.
-struct EraseDeadGrid final : public RewritePattern {
-  explicit EraseDeadGrid(MLIRContext *ctx)
+/// shard.grid is metadata for the grid configuration; erase it once unused.
+struct EraseGrid final : public RewritePattern {
+  explicit EraseGrid(MLIRContext *ctx)
       : RewritePattern("shard.grid", /*benefit=*/1, ctx) {}
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    // Commonly shard.grid returns a !shard.grid value; be conservative.
+    // Be conservative if it unexpectedly has results that are still used.
     for (Value r : op->getResults())
       if (!r.use_empty())
         return failure();
-
     rewriter.eraseOp(op);
     return success();
   }
@@ -251,16 +254,18 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     ConversionTarget target(*ctx);
     target.addIllegalDialect<shard::ShardDialect>();
     target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect, func::FuncDialect>();
+
     // Everything is legal unless it belongs to the 'shard' namespace.
     target.markUnknownOpDynamicallyLegal([](Operation *op) {
       return op->getName().getDialectNamespace() != StringRef("shard");
     });
 
     RewritePatternSet patterns(ctx);
-    patterns.add<LowerShardOp, EraseDeadShardingValue>(ctx);
+    patterns.add<LowerShardOp>(ctx);
     patterns.add<LowerProcessLinearIndex>(ctx);
     patterns.add<LowerAllSlice>(ctx);
-    patterns.add<EraseDeadGrid>(ctx);
+    patterns.add<EraseDeadShardingValue>(ctx);
+    patterns.add<EraseGrid>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
