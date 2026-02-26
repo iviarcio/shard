@@ -204,6 +204,46 @@ struct LowerShardOp final : public RewritePattern {
   }
 };
 
+/// Legalize shard.sharding even if it still has uses by proactively rewriting
+/// its known users (shard.shard) and then erasing the sharding op.
+///
+/// This avoids a common dialect-conversion pitfall where the driver visits the
+/// producer (shard.sharding) before rewriting its consumers.
+struct LegalizeSharding final : public RewritePattern {
+  explicit LegalizeSharding(MLIRContext *ctx)
+      : RewritePattern("shard.sharding", /*benefit=*/10, ctx) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (op->getNumResults() != 1)
+      return failure();
+
+    Value sh = op->getResult(0);
+
+    // Collect users first to avoid iterator invalidation while rewriting.
+    SmallVector<Operation *> users(sh.getUsers().begin(), sh.getUsers().end());
+
+    for (Operation *u : users) {
+      // In this PoC, sharding is only expected to be consumed by shard.shard.
+      if (u->getName().getStringRef() != "shard.shard")
+        return failure();
+
+      if (u->getNumOperands() < 1 || u->getNumResults() != 1)
+        return failure();
+
+      // Replace shard.shard by forwarding its tensor operand (operand 0).
+      rewriter.replaceOp(u, u->getOperand(0));
+    }
+
+    // After rewriting users, the sharding value should become dead.
+    if (!sh.use_empty())
+      return failure();
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// shard.sharding produces a !shard.sharding value used only by shard.shard/all_slice.
 /// After lowering, it should become dead. Erase if unused.
 struct EraseDeadShardingValue final : public RewritePattern {
@@ -261,6 +301,7 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     });
 
     RewritePatternSet patterns(ctx);
+    patterns.add<LegalizeSharding>(ctx); 
     patterns.add<LowerShardOp>(ctx);
     patterns.add<LowerProcessLinearIndex>(ctx);
     patterns.add<LowerAllSlice>(ctx);
