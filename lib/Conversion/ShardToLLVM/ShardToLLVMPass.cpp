@@ -291,26 +291,49 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
 
+    // Step 1: greedily rewrite shard consumers so shard.sharding becomes dead.
+    {
+      RewritePatternSet pre(ctx);
+      pre.add<LowerShardOp>(ctx);
+      pre.add<LowerAllSlice>(ctx);
+      pre.add<LowerProcessLinearIndex>(ctx);
+      pre.add<EraseGrid>(ctx);
+      (void)applyPatternsGreedily(module, std::move(pre));
+    }
+
+    // Check if still have uses of shard.sharding
+    module.walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "shard.sharding") {
+        Value sh = op->getResult(0);
+        if (!sh.use_empty()) {
+          op->emitRemark() << "shard.sharding still has uses:";
+          for (Operation *u : sh.getUsers())
+            op->emitRemark() << "  user: " << u->getName();
+        }
+      }
+    });
+
+    // Safe to cleanup: erase now-dead sharding values.
+    {
+      RewritePatternSet dce(ctx);
+      dce.add<EraseDeadShardingValue>(ctx);
+      (void)applyPatternsGreedily(module, std::move(dce));
+    }
+
+    // Step 2: enforce that no shard ops remain.
     ConversionTarget target(*ctx);
     target.addIllegalDialect<shard::ShardDialect>();
     target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect, func::FuncDialect>();
-
-    // Everything is legal unless it belongs to the 'shard' namespace.
     target.markUnknownOpDynamicallyLegal([](Operation *op) {
       return op->getName().getDialectNamespace() != StringRef("shard");
     });
 
-    RewritePatternSet patterns(ctx);
-    patterns.add<LegalizeSharding>(ctx); 
-    patterns.add<LowerShardOp>(ctx);
-    patterns.add<LowerProcessLinearIndex>(ctx);
-    patterns.add<LowerAllSlice>(ctx);
-    patterns.add<EraseDeadShardingValue>(ctx);
-    patterns.add<EraseGrid>(ctx);
-
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
+    // No more patterns needed; we're just validating legality now.
+    RewritePatternSet empty(ctx);
+    if (failed(applyPartialConversion(module, target, std::move(empty))))
       signalPassFailure();
   }
+
 };
 
 } // namespace
