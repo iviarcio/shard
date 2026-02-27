@@ -7,34 +7,91 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Register shard::ShardingInterface external models for a small set of
-// "boundary/view/sink" operations that appear in the NSP pipeline.
+// Register shard::ShardingInterface external models for a focused set of
+// "boundary / view / sink / structural" operations that appear in the NSP
+// sharding + SPMD pipeline.
 //
 // Ops covered so far:
-//   * memref.reinterpret_cast
-//   * bufferization.to_tensor
-//   * bufferization.materialize_in_destination
+//   * memref.reinterpret_cast, memref.alloc, memref.copy
+//   * bufferization.to_tensor, bufferization.materialize_in_destination
+//   * Selected scalar / control-flow ops (modeled as sharding-transparent)
 //
 // Rationale
 // ---------
-// shard-propagation depends on shard::ShardingInterface. When an op doesn't
-// implement it, propagation can stop at that boundary. These ops are common
-// around bufferization boundaries and view-like transformations.
+// shard-propagation depends on shard::ShardingInterface. If an operation
+// does not implement it, propagation may stop at that boundary.
 //
-// Design
-// ------
-// * memref.reinterpret_cast:
-//     View-only. If we are given a sharding for the source, propagate it.
-//     Otherwise, return "empty" (cannot infer).
-// * bufferization.to_tensor:
-//     Memref->tensor boundary. If the caller already proposes a result sharding,
-//     accept it; otherwise, return "empty".
-// * bufferization.materialize_in_destination:
-//     Tensor->memref sink. If the caller proposes a sharding for the tensor
-//     operand, accept it; otherwise, return "empty".
+// The ops covered here are not structured compute ops (like linalg),
+// but instead:
+//   * View-like transformations
+//   * Allocation / copy boundaries
+//   * Bufferization boundaries (tensor <-> memref)
+//   * Scalar / control-flow constructs
 //
-// For these non-structured ops we implement sharding inference/annotation
-// directly (instead of relying on loop iterator/indexing-map machinery).
+// Without explicit models, sharding inference would break when crossing
+// these operations.
+//
+// Design Principles
+// -----------------
+//
+// 1) View Ops (memref.reinterpret_cast)
+//    ----------------------------------
+//    Purely structural. No computation. If a sharding is known for the source,
+//    propagate it to the result. Otherwise return "empty" (cannot infer).
+//
+// 2) Allocation Boundary (memref.alloc)
+//    ----------------------------------
+//    Has no operands, so no intrinsic sharding can be inferred. Accept a
+//    caller-proposed result sharding if available. Otherwise return "empty".
+//
+//    Conceptually modeled as an allocation boundary that may carry externally
+//    inferred sharding information.
+//
+// 3) Explicit Copy (memref.copy)
+//    ---------------------------
+//    Structural data movement with no shape change. If source sharding is known,
+//    propagate it to destination. Otherwise, if destination sharding is known,
+//    propagate backward. Otherwise return "empty".
+//
+//    Modeled as sharding-preserving across explicit memory copies.
+//
+// 4) Bufferization Boundaries
+//    ------------------------
+//    * bufferization.to_tensor:
+//        Memref -> tensor boundary. Accept a caller-proposed result sharding
+//        if available. Otherwise return "empty".
+//
+//    * bufferization.materialize_in_destination:
+//        Tensor -> memref sink. Accept a caller-proposed tensor operand
+//        sharding if available. Otherwise return "empty".
+//
+// 5) Scalar / Control-Flow Ops
+//    --------------------------
+//    Scalar or control-flow constructs (e.g., arith ops, scf.for without
+//    loop-carried tensors, yields, etc.) are modeled as sharding-transparent
+//    when they do not introduce new tensor distribution semantics.
+//
+//    These ops:
+//      * Do not introduce new distribution structure
+//      * Do not perform collective communication
+//      * Simply forward or structurally clone partitioned values
+//
+//    For these ops, the interface typically:
+//      * Accepts existing operand/result shardings
+//      * Does not inject shard annotations
+//      * Partitions by cloning
+//
+// Implementation Strategy
+// -----------------------
+// These non-structured ops implement sharding inference and annotation
+// directly, rather than relying on iterator types or indexing maps from
+// structured linalg-like operations.
+//
+// In all cases, we:
+//   * Preserve existing sharding when semantically safe
+//   * Avoid inventing new sharding
+//   * Treat allocation/copy/bufferization/control-flow as propagation
+//     boundaries, not compute semantics.
 //
 //===----------------------------------------------------------------------===//
 
@@ -315,6 +372,144 @@ struct ReinterpretCastShardingModel
 };
 
 //===----------------------------------------------------------------------===//
+// memref.alloc
+//===----------------------------------------------------------------------===//
+
+/// memref.alloc has no operands, so we cannot infer sharding. However,
+/// shard-propagation may want to carry a user-/caller-provided sharding for the
+/// allocated buffer (e.g., when the allocation is immediately converted to
+/// tensor or copied into).
+struct AllocShardingModel
+    : public shard::ShardingInterface::ExternalModel<AllocShardingModel,
+                                                    memref::AllocOp> {
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
+
+  FailureOr<shard::ShardingOption>
+  getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
+                    ArrayRef<shard::Sharding> resultShardings) const {
+    (void)operandShardings;
+    if (op->getNumOperands() != 0 || op->getNumResults() != 1)
+      return failure();
+
+    // Accept a caller-provided sharding for the allocated buffer.
+    if (resultShardings.size() >= 1 && resultShardings[0])
+      return makeValueShardingOption(resultShardings[0]);
+
+    return shard::ShardingOption::makeEmpty();
+  }
+
+  FailureOr<std::vector<shard::Sharding>>
+  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+    auto resTy = dyn_cast<MemRefType>(op->getResult(0).getType());
+    int64_t rank = resTy ? resTy.getRank() : 0;
+
+    shard::Sharding resultSharding = fromShardingOption(op, opt, rank);
+    std::vector<shard::Sharding> res;
+    res.reserve(op->getNumOperands() + op->getNumResults());
+    res.push_back(resultSharding);
+    return res;
+  }
+
+  LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
+                                      const shard::ShardingOption &) const {
+    // No-op for memref ops.
+    return success();
+  }
+
+  LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding> operandShardings,
+                          ArrayRef<shard::Sharding> resultShardings,
+                          IRMapping &partitionMap,
+                          SymbolTableCollection &symbolTableCollection,
+                          OpBuilder &builder) const {
+    (void)operandShardings;
+    (void)resultShardings;
+    (void)symbolTableCollection;
+    return partitionByCloning(op, partitionedOperands, partitionMap, builder);
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// memref.copy
+//===----------------------------------------------------------------------===//
+
+/// We do not insert annotations on memrefs, but we can still propagate a
+/// known sharding from the source to the destination to keep information
+/// across explicit copies.
+struct CopyShardingModel
+    : public shard::ShardingInterface::ExternalModel<CopyShardingModel,
+                                                    memref::CopyOp> {
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
+
+  FailureOr<shard::ShardingOption>
+  getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
+                    ArrayRef<shard::Sharding> resultShardings) const {
+    (void)resultShardings;
+    if (op->getNumOperands() != 2 || op->getNumResults() != 0)
+      return failure();
+
+    // Prefer known source sharding; otherwise accept a known destination sharding.
+    if (operandShardings.size() >= 1 && operandShardings[0])
+      return makeValueShardingOption(operandShardings[0]);
+    if (operandShardings.size() >= 2 && operandShardings[1])
+      return makeValueShardingOption(operandShardings[1]);
+
+    return shard::ShardingOption::makeEmpty();
+  }
+
+  FailureOr<std::vector<shard::Sharding>>
+  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+    auto srcTy = dyn_cast<MemRefType>(op->getOperand(0).getType());
+    int64_t rank = srcTy ? srcTy.getRank() : 0;
+    shard::Sharding s = fromShardingOption(op, opt, rank);
+
+    std::vector<shard::Sharding> res;
+    res.reserve(op->getNumOperands() + op->getNumResults());
+    res.push_back(s); // src
+    res.push_back(s); // dst
+    return res;
+  }
+
+  LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
+                                      const shard::ShardingOption &) const {
+    // No-op for memref ops.
+    return success();
+  }
+
+  LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding> operandShardings,
+                          ArrayRef<shard::Sharding> resultShardings,
+                          IRMapping &partitionMap,
+                          SymbolTableCollection &symbolTableCollection,
+                          OpBuilder &builder) const {
+    (void)operandShardings;
+    (void)resultShardings;
+    (void)symbolTableCollection;
+    return partitionByCloning(op, partitionedOperands, partitionMap, builder);
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // bufferization.to_tensor
 //===----------------------------------------------------------------------===//
 
@@ -524,11 +719,12 @@ namespace hexagon {
 /// This must be called during compiler initialization (DialectRegistry setup).
 void registerNSPShardInterfaceModels(DialectRegistry &registry) {
 
-  // Cover memref.reinterpret_cast
+  // Cover memref.reinterpret_cast, memref.alloc, memref.copy
   registry.addExtension(+[](MLIRContext *ctx, memref::MemRefDialect *dialect) {
     (void)dialect;
-    memref::ReinterpretCastOp::attachInterface<ReinterpretCastShardingModel>(
-        *ctx);
+    memref::ReinterpretCastOp::attachInterface<ReinterpretCastShardingModel>(*ctx);
+    memref::AllocOp::attachInterface<AllocShardingModel>(*ctx);
+    memref::CopyOp::attachInterface<CopyShardingModel>(*ctx);
   });
 
   // Cover bufferization.to_tensor & bufferization.materialize_in_destination
