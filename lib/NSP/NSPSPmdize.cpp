@@ -30,10 +30,12 @@
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
 
+#include <functional>
 #include <iterator>
 #include <optional>
 
@@ -533,6 +535,157 @@ struct NSPSpmdizePass
         }
       };
 
+      // Strip trivial wrapper ops (shard.shard, tensor.cast) to expose a real
+      // defining op for bring-up pattern matching.
+      auto stripTrivialWrappers = [&](Value v) -> Value {
+        Value cur = v;
+        while (Operation *def = cur.getDefiningOp()) {
+          if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(def)) {
+            if (shardOp->getNumOperands() < 1)
+              break;
+            cur = shardOp->getOperand(0);
+            continue;
+          }
+          if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
+            cur = castOp.getSource();
+            continue;
+          }
+          break;
+        }
+        return cur;
+      };
+
+      auto isCompatibleElementwiseGeneric =
+          [&](mlir::linalg::GenericOp prod, RankedTensorType expectedLocalTy)
+              -> bool {
+        const int64_t nIn = prod.getNumDpsInputs();
+        if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
+          return false;
+        if (prod.getNumLoops() != 1)
+          return false;
+
+        auto iters = prod.getIteratorTypesArray();
+        if (iters.size() != 1 ||
+            iters.front() != mlir::utils::IteratorType::parallel)
+          return false;
+
+        auto maps = prod.getIndexingMapsArray();
+        if (static_cast<int64_t>(maps.size()) != nIn + 1)
+          return false;
+        for (AffineMap m : maps)
+          if (!m.isIdentity())
+            return false;
+
+        auto resTy = dyn_cast<RankedTensorType>(prod.getResult(0).getType());
+        if (!resTy || resTy.getRank() != 1)
+          return false;
+
+        auto prodLocalTy = getLocalType(resTy);
+        if (!prodLocalTy || prodLocalTy != expectedLocalTy)
+          return false;
+
+        for (int64_t i = 0; i < nIn; ++i) {
+          auto inTy = dyn_cast<RankedTensorType>(
+              prod.getDpsInputOperand(i)->get().getType());
+          if (!inTy || inTy.getRank() != 1)
+            return false;
+          if (getLocalType(inTy) != expectedLocalTy)
+            return false;
+        }
+        return true;
+      };
+
+      // Build a local-tile version of a global value by cloning a chain of
+      // compatible elementwise producers. This avoids materializing full global
+      // intermediates when only the final store is tiled.
+      std::function<Value(Value, RankedTensorType,
+                          llvm::DenseMap<Value, Value> &)>
+          materializeLocalValue =
+              [&](Value v, RankedTensorType expectedLocalTy,
+                  llvm::DenseMap<Value, Value> &cache) -> Value {
+        Value base = stripTrivialWrappers(v);
+        auto it = cache.find(base);
+        if (it != cache.end())
+          return it->second;
+
+        // linalg.fill: produce a local constant tile.
+        if (auto fill =
+                dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
+          Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
+              fill.getLoc(), expectedLocalTy.getShape(),
+              expectedLocalTy.getElementType());
+          auto localFill = b.create<mlir::linalg::FillOp>(
+              fill.getLoc(), /*inputs=*/ValueRange{fill.getInput()},
+              /*outputs=*/ValueRange{outLocalInit});
+          Value localRes = localFill.getResult(0);
+          cache[base] = localRes;
+          return localRes;
+        }
+
+        // linalg.generic: clone producer locally if compatible.
+        if (auto prod = dyn_cast_or_null<mlir::linalg::GenericOp>(
+                base.getDefiningOp())) {
+          if (isCompatibleElementwiseGeneric(prod, expectedLocalTy)) {
+            SmallVector<Value> prodInputs;
+            const int64_t nIn = prod.getNumDpsInputs();
+            prodInputs.reserve(nIn);
+            for (int64_t i = 0; i < nIn; ++i) {
+              Value inV = prod.getDpsInputOperand(i)->get();
+              prodInputs.push_back(
+                  materializeLocalValue(inV, expectedLocalTy, cache));
+            }
+
+            Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
+                prod.getLoc(), expectedLocalTy.getShape(),
+                expectedLocalTy.getElementType());
+
+            auto newProd = b.create<mlir::linalg::GenericOp>(
+                prod.getLoc(),
+                /*resultTensorTypes=*/TypeRange{expectedLocalTy},
+                /*inputs=*/ValueRange{prodInputs},
+                /*outputs=*/ValueRange{outLocalInit},
+                /*indexingMaps=*/prod.getIndexingMaps(),
+                /*iteratorTypes=*/prod.getIteratorTypes(),
+                /*doc=*/nullptr, /*libraryCall=*/nullptr);
+
+            // Ensure the region is empty before cloning.
+            newProd.getRegion().getBlocks().clear();
+
+            // Clone the region body.
+            Block &srcBlock = prod.getRegion().front();
+            Block *dstBlock = new Block();
+            newProd.getRegion().push_back(dstBlock);
+            for (BlockArgument a : srcBlock.getArguments())
+              dstBlock->addArgument(a.getType(), a.getLoc());
+
+            IRMapping map;
+            for (auto [sa, da] :
+                 llvm::zip(srcBlock.getArguments(),
+                           dstBlock->getArguments()))
+              map.map(sa, da);
+
+            OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
+            for (Operation &op : srcBlock.getOperations())
+              nb.clone(op, map);
+
+            Value localRes = newProd.getResult(0);
+            cache[base] = localRes;
+            return localRes;
+          }
+        }
+
+        // Fallback: slice the global value.
+        Value local = mlir::shard::AllSliceOp::create(
+                          b, base.getLoc(), /*result_type=*/expectedLocalTy,
+                          /*input=*/base,
+                          /*grid=*/"nsp",
+                          /*gridAxes=*/gridAxes,
+                          /*sliceAxis=*/splitAxis)
+                          .getResult();
+        cache[base] = local;
+        return local;
+      };
+
       // Use a worklist since we'll rewrite in-place.
       SmallVector<mlir::linalg::GenericOp> worklist;
       func.walk([&](mlir::linalg::GenericOp g) {
@@ -632,17 +785,15 @@ struct NSPSpmdizePass
         }
 
         // Slice inputs into per-core tiles.
+        //
+        // For chained elementwise patterns, attempt to clone compatible producers
+        // into local-tile compute instead of slicing full global intermediates.
+        llvm::DenseMap<Value, Value> localCache;
         SmallVector<Value> localInputs;
         localInputs.reserve(numInputs);
-        for (Value in : inputs) {
-          localInputs.push_back(
-              mlir::shard::AllSliceOp::create(
-                  b, loc, /*result_type=*/localTy,
-                  /*input=*/in,
-                  /*grid=*/"nsp",
-                  /*gridAxes=*/gridAxes,
-                  /*sliceAxis=*/splitAxis).getResult());
-        }
+        for (Value in : inputs)
+          localInputs.push_back(materializeLocalValue(in, localTy, localCache));
+ 
 
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
