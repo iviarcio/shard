@@ -615,7 +615,7 @@ struct NSPSpmdizePass
               fill.getLoc(), expectedLocalTy.getShape(),
               expectedLocalTy.getElementType());
           auto localFill = b.create<mlir::linalg::FillOp>(
-              fill.getLoc(), /*inputs=*/ValueRange{fill.getInput()},
+              fill.getLoc(), /*inputs=*/fill.getInputs(),
               /*outputs=*/ValueRange{outLocalInit});
           Value localRes = localFill.getResult(0);
           cache[base] = localRes;
