@@ -19,10 +19,21 @@
 #ifndef QCOM_HEXAGON_BACKEND_NSP_NSPPASSES_H
 #define QCOM_HEXAGON_BACKEND_NSP_NSPPASSES_H
 
+#include <memory>
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/Pass/Pass.h"
 
 namespace mlir {
 namespace hexagon {
+
+/// Factory for the NSP shard planner pass.
+std::unique_ptr<mlir::Pass> createNSPShardPlannerPass();
+std::unique_ptr<mlir::Pass> createNSPShardPlannerPass(int64_t nspCount,
+                                                      bool allowCollectives);
+
+/// Factory for the NSP SPMDization/materialization pass.
+std::unique_ptr<mlir::Pass> createNSPSpmdizePass();
+std::unique_ptr<mlir::Pass> createNSPSpmdizePass(bool allowCollectives);
 
 /// Register individual NSP passes (e.g., planner, materialization) so they are
 /// visible to the MLIR pass registry (e.g., --list-passes).
