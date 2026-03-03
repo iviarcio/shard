@@ -24,7 +24,7 @@
 namespace mlir {
 namespace hexagon {
 
-/// Register individual NSP passes (e.g., planner, validation, etc.) so they are
+/// Register individual NSP passes (e.g., planner, materialization) so they are
 /// visible to the MLIR pass registry (e.g., --list-passes).
 void registerNSPPasses();
 
