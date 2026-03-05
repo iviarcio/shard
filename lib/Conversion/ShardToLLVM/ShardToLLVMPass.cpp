@@ -7,11 +7,67 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Pass for lowering shard dialect ops produced by NSP sharding/materialization.
-// This pass is intentionally narrow: it targets the exact shard ops used by vadd
-// (shard.sharding, shard.shard, shard.process_linear_index, shard.all_slice) and
-// rewrites them into standard MLIR (arith/tensor) so the existing linalg-to-llvm
-// pipeline can finish the lowering.
+// Pass for lowering shard dialect ops produced by the NSP sharding pipeline.
+//
+// Scope / intent
+// --------------
+// This module started as a PoC, but it is intended to evolve into a production
+// lowering as more apps and sharding patterns are exercised.
+//
+// The pass currently supports only a small, well-defined subset of shard ops
+// emitted by the NSP sharding/materialization flow and rewrites them into
+// standard MLIR (arith/tensor) so the downstream linalg-to-llvm pipeline can
+// complete lowering.
+//
+// Supported shard ops
+// -------------------
+//   - shard.process_linear_index
+//   - shard.all_slice  (ranked 1-D tensors, static slice size)
+//   - shard.shard      (treated as an annotation carrier)
+//   - shard.sharding   (erased once unused)
+//   - shard.grid       (erased once unused)
+//
+// ABI notes
+// ---------
+// The lowering of shard.process_linear_index is tied to the Hexagon entry-point
+// ABI used by the runtime: we recover {coreId, threadId, numThreadsPerCore}
+// from the tail of the function arguments and compute:
+//   linearIdx = coreId * numThreadsPerCore + threadId
+//
+// Robustness with chained producer/consumer graphs
+// -----------------------------------------------
+// Some frontends emit a *chain* of elementwise tensor producers (often multiple
+// linalg.generic ops) rather than a single fused kernel. In such cases sharding
+// annotations frequently appear on multiple intermediate tensors, typically by
+// wrapping SSA values with shard.shard while reusing a shared !shard.sharding.
+//
+// Dialect conversion treats the whole shard dialect as illegal, therefore *all*
+// shard ops must be rewritten. A common failure mode is erasing shard.sharding
+// while it still has uses (e.g. intermediate shard.shard ops): the conversion
+// driver may visit shard.sharding before rewriting all of its users.
+//
+// To keep legalization robust for chained patterns, this pass follows a simple
+// discipline:
+//   (1) rewrite the *users* first (shard.shard and shard.all_slice),
+//   (2) erase shard.sharding and shard.grid only once they become dead.
+//
+// Current semantic restrictions
+// -----------------------------
+// This lowering assumes that sharding is used for SPMD-style DOALL execution on
+// independent slices. In particular, it does not currently materialize any
+// cross-shard communication.
+//
+// Consequences:
+//   - Elementwise chains are fine (all ops operate on per-shard slices).
+//   - Reductions are only safe if the reduction does *not* need to combine
+//     partial results across shards.
+//       * If the reduced dimension is fully local to each shard (i.e. the value
+//         being reduced is not partitioned across shards), the reduction can
+//         remain local.
+//       * If the reduced dimension is partitioned across shards, the lowering
+//         must introduce a collective (e.g. shard.all_reduce) to combine partial
+//         reductions, followed by any necessary broadcasts.
+//   - Collective ops such as shard.all_reduce are not lowered yet.
 //
 //===----------------------------------------------------------------------===//
 
@@ -27,7 +83,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "llvm/Support/Debug.h"
 
@@ -42,8 +97,13 @@ using namespace mlir;
 
 namespace {
 
-// Pick linear-index components by fixed offsets from the last function arg.
-// Right-to-left (last -> first): [0], cid, tid, [1], num_cores, ntpc, ...
+// Resolve linear-index components from the entry-point signature.
+//
+// NOTE: This is ABI-specific by construction.
+// The current Hexagon runtime ABI appends execution IDs at the tail of the
+// entry-point signature. Right-to-left (last -> first), the relevant slots look
+// like:
+//   [..., ntpc, num_cores, <reserved>, tid, cid, <reserved>]
 //
 // Therefore, with last = args[N-1]:
 //   cid  = args[N-2]
@@ -127,9 +187,16 @@ struct LowerProcessLinearIndex final : public RewritePattern {
 
 };
 
-/// Lower shard.all_slice(%tensor, %sharding {grid_axes=[...], slice_axis=i})
-/// into tensor.extract_slice, with offset computed from linearIdx.
-/// We support only ranked 1-D tensors with static slice size.
+/// Lower shard.all_slice into tensor.extract_slice.
+///
+/// The slice offset is derived from the linear process id:
+///   offset = linearIdx * sliceSize
+///
+/// Restrictions (current implementation):
+///   - ranked 1-D tensors only
+///   - static slice size only
+///   - slicing is along dim 0 and the offset is derived from linearIdx
+///   - no bounds/padding handling (assumes exact partitioning)
 struct LowerAllSlice final : public RewritePattern {
   explicit LowerAllSlice(MLIRContext *ctx)
       : RewritePattern("shard.all_slice", /*benefit=*/1, ctx) {}
@@ -186,8 +253,18 @@ struct LowerAllSlice final : public RewritePattern {
 
 };
 
-/// shard.shard is treated as an annotation carrier. Replace it by
-/// its tensor operand (operand 0), ignoring the sharding metadata.
+/// Lower shard.shard.
+///
+/// In the current NSP sharding flow, shard.shard is used as an *annotation
+/// carrier* on SSA tensor values ("this value is sharded like X") and does not
+/// materialize any data movement.
+///
+/// Therefore lowering can conservatively drop the wrapper and keep the tensor
+/// operand (operand 0).
+///
+/// IMPORTANT: if shard.shard gains semantic meaning in the future (e.g.
+/// materializing layout/resharding or changing buffer placement), this lowering
+/// must be revisited.
 struct LowerShardOp final : public RewritePattern {
   explicit LowerShardOp(MLIRContext *ctx)
       : RewritePattern("shard.shard", /*benefit=*/1, ctx) {}
@@ -205,48 +282,17 @@ struct LowerShardOp final : public RewritePattern {
   }
 };
 
-/// Legalize shard.sharding even if it still has uses by proactively rewriting
-/// its known users (shard.shard) and then erasing the sharding op.
+/// Erase dead shard.sharding values.
 ///
-/// This avoids a common dialect-conversion pitfall where the driver visits the
-/// producer (shard.sharding) before rewriting its consumers.
-struct LegalizeSharding final : public RewritePattern {
-  explicit LegalizeSharding(MLIRContext *ctx)
-      : RewritePattern("shard.sharding", /*benefit=*/10, ctx) {}
-
-  LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const override {
-    if (op->getNumResults() != 1)
-      return failure();
-
-    Value sh = op->getResult(0);
-
-    // Collect users first to avoid iterator invalidation while rewriting.
-    SmallVector<Operation *> users(sh.getUsers().begin(), sh.getUsers().end());
-
-    for (Operation *u : users) {
-      // In this PoC, sharding is only expected to be consumed by shard.shard.
-      if (u->getName().getStringRef() != "shard.shard")
-        return failure();
-
-      if (u->getNumOperands() < 1 || u->getNumResults() != 1)
-        return failure();
-
-      // Replace shard.shard by forwarding its tensor operand (operand 0).
-      rewriter.replaceOp(u, u->getOperand(0));
-    }
-
-    // After rewriting users, the sharding value should become dead.
-    if (!sh.use_empty())
-      return failure();
-
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-/// shard.sharding produces a !shard.sharding value used only by shard.shard/all_slice.
-/// After lowering, it should become dead. Erase if unused.
+/// shard.sharding produces a !shard.sharding SSA value that is typically used
+/// by multiple shard.shard and/or shard.all_slice ops.
+///
+/// During dialect conversion, erasing shard.sharding too early can be brittle
+/// when there are chained producers/consumers: the conversion driver may visit
+/// the producer before rewriting all users.
+///
+/// This pattern is intentionally conservative: only erase shard.sharding once
+/// the result has no remaining uses.
 struct EraseDeadShardingValue final : public RewritePattern {
   explicit EraseDeadShardingValue(MLIRContext *ctx)
       : RewritePattern("shard.sharding", /*benefit=*/1, ctx) {}
@@ -264,7 +310,10 @@ struct EraseDeadShardingValue final : public RewritePattern {
   }
 };
 
-/// shard.grid is metadata for the grid configuration; erase it once unused.
+/// Erase shard.grid once unused.
+///
+/// shard.grid is currently treated as metadata that becomes redundant after all
+/// shard ops are lowered.
 struct EraseGrid final : public RewritePattern {
   explicit EraseGrid(MLIRContext *ctx)
       : RewritePattern("shard.grid", /*benefit=*/1, ctx) {}
@@ -334,7 +383,6 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     if (failed(applyPartialConversion(module, target, std::move(empty))))
       signalPassFailure();
   }
-
 };
 
 } // namespace
