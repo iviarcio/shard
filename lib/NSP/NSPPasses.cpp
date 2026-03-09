@@ -20,23 +20,23 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/IR/DialectRegistry.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Pass/PassRegistry.h"
-#include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 
 // Useful common transforms.
-#include "mlir/Transforms/Passes.h"        // canonicalizer, cse
+#include "mlir/Transforms/Passes.h" // canonicalizer, cse
 
 // shard dialect IR (GridOp, ShardOp, collectives, attrs).
-#include "mlir/Dialect/Shard/Transforms/Passes.h"
-#include "mlir/Dialect/Shard/IR/ShardOps.h"
-#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
+#include "mlir/Dialect/Shard/IR/ShardOps.h"
+#include "mlir/Dialect/Shard/Transforms/Passes.h"
 
 #include "hexagon/NSP/NSPPasses.h"
 
@@ -143,8 +143,10 @@ namespace hexagon {
 /// For now, we use an explicit style that works well for tests.
 void registerNSPPasses() {
   // The lambda form avoids needing the pass type visible here.
-  registerPass([]() -> std::unique_ptr<Pass> { return createNSPShardPlannerPass(); });
-  registerPass([]() -> std::unique_ptr<Pass> { return createNSPSpmdizePass(); });
+  registerPass(
+      []() -> std::unique_ptr<Pass> { return createNSPShardPlannerPass(); });
+  registerPass(
+      []() -> std::unique_ptr<Pass> { return createNSPSpmdizePass(); });
 }
 
 /// Register NSP pipelines.
@@ -157,8 +159,7 @@ void registerNSPPipelines() {
 
 /// Register dialect extensions required by NSP sharding propagation.
 void registerNSPDialectExtensions(DialectRegistry &registry) {
-  registry.insert<mlir::func::FuncDialect,
-                  mlir::memref::MemRefDialect,
+  registry.insert<mlir::func::FuncDialect, mlir::memref::MemRefDialect,
                   mlir::bufferization::BufferizationDialect,
                   mlir::shard::ShardDialect>();
 

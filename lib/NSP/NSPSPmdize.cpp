@@ -68,11 +68,10 @@ struct NSPSpmdizePass
   /// Constructor used by createNSPSpmdizePass(bool).
   explicit NSPSpmdizePass(bool allow)
       : PassWrapper(),
-        allowCollectives(
-            *this, "allow-collectives",
-            llvm::cl::desc(
-                "Allow NSPSpmdize to insert shard collectives (e.g. all_gather)"),
-            llvm::cl::init(allow)) {}
+        allowCollectives(*this, "allow-collectives",
+                         llvm::cl::desc("Allow NSPSpmdize to insert shard "
+                                        "collectives (e.g. all_gather)"),
+                         llvm::cl::init(allow)) {}
 
   /// PassWrapper's default clonePass implementation relies on a copy
   /// constructor. Pass::Option is not copyable, so we must explicitly define
@@ -109,9 +108,9 @@ struct NSPSpmdizePass
     auto grid = module.lookupSymbol<mlir::shard::GridOp>("nsp");
     if (!grid) {
       module.emitError()
-        << "NSPSpmdizePass expected a 'shard.grid' symbol named '@nsp' "
-           "in the module, but none was found. "
-           "Ensure NSP shard planning ran and created the grid.";
+          << "NSPSpmdizePass expected a 'shard.grid' symbol named '@nsp' "
+             "in the module, but none was found. "
+             "Ensure NSP shard planning ran and created the grid.";
       signalPassFailure();
       return;
     }
@@ -132,8 +131,8 @@ struct NSPSpmdizePass
       return;
     }
 
-    // HELPER for strip shard tensor annotations inside loops that were explicitly
-    // distributed by this pass (marked with 'nsp.distributed').
+    // HELPER for strip shard tensor annotations inside loops that were
+    // explicitly distributed by this pass (marked with 'nsp.distributed').
     //
     // Rationale:
     // In non-collective mode, the SPMD partitioning is expressed by the loop
@@ -164,8 +163,9 @@ struct NSPSpmdizePass
               eraseList.push_back(op);
             });
 
-            // 2: Erase shard.sharding descriptors inside the loop body if unused.
-            // These usually become dead after removing shard.shard wrappers.
+            // 2: Erase shard.sharding descriptors inside the loop body if
+            // unused. These usually become dead after removing shard.shard
+            // wrappers.
             body->walk([&](mlir::shard::ShardingOp op) {
               if (op->getNumResults() != 1)
                 return;
@@ -192,7 +192,8 @@ struct NSPSpmdizePass
     // This avoids any communication and preserves semantics for reductions
     // within the loop body.
 
-    auto distributeScfForCyclic = [&](mlir::func::FuncOp func) -> LogicalResult {
+    auto distributeScfForCyclic =
+        [&](mlir::func::FuncOp func) -> LogicalResult {
       OpBuilder b(func.getContext());
       SmallVector<mlir::scf::ForOp> loops;
       func.walk([&](mlir::scf::ForOp forOp) { loops.push_back(forOp); });
@@ -204,7 +205,8 @@ struct NSPSpmdizePass
         if (v == iv)
           return true;
 
-        // BFS over the def-use chain backwards (operand -> defining op -> its operands).
+        // BFS over the def-use chain backwards (operand -> defining op -> its
+        // operands).
         llvm::SmallVector<Value, 16> worklist;
         llvm::SmallPtrSet<Value, 32> visited;
         worklist.push_back(v);
@@ -227,13 +229,11 @@ struct NSPSpmdizePass
 
           // Allow common integer/index plumbing ops.
           // This intentionally ignores complex control/dataflow.
-          if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp,
-                  arith::DivSIOp, arith::DivUIOp,
-                  arith::RemSIOp, arith::RemUIOp,
-                  arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
-                  arith::AndIOp, arith::OrIOp, arith::XOrIOp,
-                  arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
-                  arith::IndexCastOp, arith::IndexCastUIOp,
+          if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+                  arith::DivUIOp, arith::RemSIOp, arith::RemUIOp, arith::ShLIOp,
+                  arith::ShRSIOp, arith::ShRUIOp, arith::AndIOp, arith::OrIOp,
+                  arith::XOrIOp, arith::ExtSIOp, arith::ExtUIOp,
+                  arith::TruncIOp, arith::IndexCastOp, arith::IndexCastUIOp,
                   arith::ConstantOp>(def)) {
             for (Value opnd : def->getOperands())
               enqueue(opnd);
@@ -271,9 +271,9 @@ struct NSPSpmdizePass
         if (foundIvIndexedStore)
           return true;
 
-        // bufferization.materialize_in_destination where dest is a view into the
-        // output buffer whose dynamic offset is derived from the IV.
-        // This matches patterns like:
+        // bufferization.materialize_in_destination where dest is a view into
+        // the output buffer whose dynamic offset is derived from the IV. This
+        // matches patterns like:
         //   %sv = memref.subview %dst[%off] ...
         //   bufferization.materialize_in_destination %t, %sv
         // as well as:
@@ -325,7 +325,8 @@ struct NSPSpmdizePass
           continue;
 
         // Only distribute loops that look DOALL and "tile-store" safe:
-        // the IV must participate in the output addressing (store/subview offset).
+        // the IV must participate in the output addressing (store/subview
+        // offset).
         if (!shouldDistributeLoop(forOp))
           continue;
 
@@ -338,9 +339,9 @@ struct NSPSpmdizePass
 
         if (ivIntTy && ivIntTy.getWidth() < 32) {
           // Avoid silent overflow for small index types (e.g., i16).
-          forOp.emitRemark()
-              << "NSPSpmdize: skipping scf.for distribution for small integer IV type "
-              << ivTy;
+          forOp.emitRemark() << "NSPSpmdize: skipping scf.for distribution for "
+                                "small integer IV type "
+                             << ivTy;
           continue;
         }
 
@@ -348,8 +349,10 @@ struct NSPSpmdizePass
         Value ub = forOp.getUpperBound();
         Value step = forOp.getStep();
 
-        // Require bounds/step to match the IV type to keep the transformation simple.
-        if (lb.getType() != ivTy || ub.getType() != ivTy || step.getType() != ivTy)
+        // Require bounds/step to match the IV type to keep the transformation
+        // simple.
+        if (lb.getType() != ivTy || ub.getType() != ivTy ||
+            step.getType() != ivTy)
           continue;
 
         Location loc = forOp.getLoc();
@@ -357,7 +360,8 @@ struct NSPSpmdizePass
 
         // procIdx: index in [0, numShards)
         Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
-        // Cast procIdx to the IV type (index stays index; integer gets index_cast).
+        // Cast procIdx to the IV type (index stays index; integer gets
+        // index_cast).
         Value procInIvTy = procIdx;
         if (!ivIsIndex)
           procInIvTy = b.create<arith::IndexCastOp>(loc, ivTy, procIdx);
@@ -368,7 +372,8 @@ struct NSPSpmdizePass
 
         // newStep = step * numShards
         Value cNum = ivIsIndex
-                         ? static_cast<Value>(b.create<arith::ConstantIndexOp>(loc, numShards))
+                         ? static_cast<Value>(
+                               b.create<arith::ConstantIndexOp>(loc, numShards))
                          : static_cast<Value>(b.create<arith::ConstantIntOp>(
                                loc, numShards, ivIntTy.getWidth()));
 
@@ -409,7 +414,8 @@ struct NSPSpmdizePass
 
     if (!allowCollectives) {
       // In non-collective mode, prioritize loop distribution. This is the
-      // required strategy for patterns with intra-tile reductions (e.g. softmax).
+      // required strategy for patterns with intra-tile reductions (e.g.
+      // softmax).
       module.walk([&](mlir::func::FuncOp func) {
         if (failed(distributeScfForCyclic(func))) {
           signalPassFailure();
@@ -423,7 +429,6 @@ struct NSPSpmdizePass
       module.walk([&](mlir::func::FuncOp func) {
         stripShardAnnotationsInDistributedLoops(func);
       });
-
     }
 
     // Optionally sanity-check that we have some sharding descriptors.
@@ -489,11 +494,9 @@ struct NSPSpmdizePass
       //
       // In store-by-tile mode, we rewrite the materialization to store the
       // local tile into a subview of %dst, and erase the wrapper chain.
-      auto findMaterializeSink =
-          [&](Value v)
-              -> std::optional<std::pair<
-                  bufferization::MaterializeInDestinationOp,
-                  SmallVector<Operation *>>> {
+      auto findMaterializeSink = [&](Value v)
+          -> std::optional<std::pair<bufferization::MaterializeInDestinationOp,
+                                     SmallVector<Operation *>>> {
         SmallVector<Operation *> wrappers;
         Value cur = v;
 
@@ -556,8 +559,8 @@ struct NSPSpmdizePass
       };
 
       auto isCompatibleElementwiseGeneric =
-          [&](mlir::linalg::GenericOp prod, RankedTensorType expectedLocalTy)
-              -> bool {
+          [&](mlir::linalg::GenericOp prod,
+              RankedTensorType expectedLocalTy) -> bool {
         const int64_t nIn = prod.getNumDpsInputs();
         if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
           return false;
@@ -660,8 +663,7 @@ struct NSPSpmdizePass
 
             IRMapping map;
             for (auto [sa, da] :
-                 llvm::zip(srcBlock.getArguments(),
-                           dstBlock->getArguments()))
+                 llvm::zip(srcBlock.getArguments(), dstBlock->getArguments()))
               map.map(sa, da);
 
             OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
@@ -688,9 +690,7 @@ struct NSPSpmdizePass
 
       // Use a worklist since we'll rewrite in-place.
       SmallVector<mlir::linalg::GenericOp> worklist;
-      func.walk([&](mlir::linalg::GenericOp g) {
-        worklist.push_back(g);
-      });
+      func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
 
       for (mlir::linalg::GenericOp g : worklist) {
         // Pattern: elementwise 1D generic with identity maps.
@@ -758,10 +758,11 @@ struct NSPSpmdizePass
         // Inputs must be consistently splittable.
         for (RankedTensorType t : inputTys) {
           if (getLocalType(t) != localTy) {
-            g.emitError() << "NSPSpmdize: unsupported elementwise generic; input "
-                             "types are not consistently splittable along axis 0";
-          signalPassFailure();
-          return;
+            g.emitError()
+                << "NSPSpmdize: unsupported elementwise generic; input "
+                   "types are not consistently splittable along axis 0";
+            signalPassFailure();
+            return;
           }
         }
 
@@ -786,14 +787,14 @@ struct NSPSpmdizePass
 
         // Slice inputs into per-core tiles.
         //
-        // For chained elementwise patterns, attempt to clone compatible producers
-        // into local-tile compute instead of slicing full global intermediates.
+        // For chained elementwise patterns, attempt to clone compatible
+        // producers into local-tile compute instead of slicing full global
+        // intermediates.
         llvm::DenseMap<Value, Value> localCache;
         SmallVector<Value> localInputs;
         localInputs.reserve(numInputs);
         for (Value in : inputs)
           localInputs.push_back(materializeLocalValue(in, localTy, localCache));
- 
 
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
@@ -821,17 +822,20 @@ struct NSPSpmdizePass
         // shard.all_gather and keep the existing destination materialization.
         //
         // *allowCollectives=false store the local tile directly into a
-        // subview of the global destination (store-by-tile), avoiding communication.
+        // subview of the global destination (store-by-tile), avoiding
+        // communication.
 
         Value localResult = newGeneric.getResult(0);
 
         if (allowCollectives) {
-          Value globalResult = mlir::shard::AllGatherOp::create(
-              b, loc, /*result=*/outResTy,
-              /*grid=*/"nsp",
-              /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
-              /*input=*/localResult,
-              /*gather_axis=*/splitAxisAP).getResult();
+          Value globalResult =
+              mlir::shard::AllGatherOp::create(
+                  b, loc, /*result=*/outResTy,
+                  /*grid=*/"nsp",
+                  /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
+                  /*input=*/localResult,
+                  /*gather_axis=*/splitAxisAP)
+                  .getResult();
           g.getResult(0).replaceAllUsesWith(globalResult);
           g.erase();
           continue;
@@ -854,7 +858,8 @@ struct NSPSpmdizePass
         auto localResTy = dyn_cast<RankedTensorType>(localResult.getType());
         int64_t tileSize = localResTy.getDimSize(0);
         if (ShapedType::isDynamic(tileSize)) {
-          mat.emitError() << "NSPSpmdize: store-by-tile requires a static tile size";
+          mat.emitError()
+              << "NSPSpmdize: store-by-tile requires a static tile size";
           signalPassFailure();
           return;
         }
@@ -869,21 +874,23 @@ struct NSPSpmdizePass
         Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
         Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
 
-        SmallVector<OpFoldResult> offsets = {offset};                  // dynamic offset
-        SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};  // static size
-        SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};       // static stride
+        SmallVector<OpFoldResult> offsets = {offset}; // dynamic offset
+        SmallVector<OpFoldResult> sizes = {
+            b.getIndexAttr(tileSize)}; // static size
+        SmallVector<OpFoldResult> strides = {
+            b.getIndexAttr(1)}; // static stride
 
         // Create a subview into the destination buffer corresponding to this
         // process' tile.
         auto subLayout = StridedLayoutAttr::get(
             destTy.getContext(), /*offset=*/ShapedType::kDynamic,
             /*strides=*/ArrayRef<int64_t>{1});
-        auto subTy = MemRefType::get(
-            ArrayRef<int64_t>{tileSize}, destTy.getElementType(), subLayout,
-            destTy.getMemorySpace());
+        auto subTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
+                                     destTy.getElementType(), subLayout,
+                                     destTy.getMemorySpace());
 
-        Value destSubview =
-            b.create<memref::SubViewOp>(loc, subTy, dest, offsets, sizes, strides);
+        Value destSubview = b.create<memref::SubViewOp>(
+            loc, subTy, dest, offsets, sizes, strides);
 
         // Rewrite the materialization to store only this tile.
         mat->setOperand(0, localResult);
@@ -900,7 +907,6 @@ struct NSPSpmdizePass
   }
 
 private:
-
 };
 
 } // namespace

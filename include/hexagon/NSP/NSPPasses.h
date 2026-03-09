@@ -19,17 +19,16 @@
 #ifndef QCOM_HEXAGON_BACKEND_NSP_NSPPASSES_H
 #define QCOM_HEXAGON_BACKEND_NSP_NSPPASSES_H
 
-#include <memory>
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/Pass.h"
+#include <memory>
 
 namespace mlir {
 namespace hexagon {
 
 /// Factory for the NSP shard planner pass.
 std::unique_ptr<mlir::Pass> createNSPShardPlannerPass();
-std::unique_ptr<mlir::Pass> createNSPShardPlannerPass(int64_t nspCount,
-                                                      bool allowCollectives);
+std::unique_ptr<mlir::Pass> createNSPShardPlannerPass(int64_t nspCount, bool allowCollectives);
 
 /// Factory for the NSP SPMDization/materialization pass.
 std::unique_ptr<mlir::Pass> createNSPSpmdizePass();
@@ -60,4 +59,3 @@ void registerNSPShardInterfaceModels(mlir::DialectRegistry &registry);
 } // namespace mlir
 
 #endif // QCOM_HEXAGON_BACKEND_NSP_NSPPASSES_H
-

@@ -18,15 +18,14 @@
 include "mlir/Pass/PassBase.td"
 
 def ShardToLLVM : Pass<"shard-to-llvm", "mlir::ModuleOp"> {
-  let summary = "Lower shard dialect elementwise ops (e.g., vadd materialized) to arith/tensor";
+  let summary = "Lower shard dialect elementwise ops (e.g., vadd materialized) "
+                "to arith/tensor";
   let constructor = "mlir::hexagon::createShardToLLVMPass()";
 
-  let dependentDialects = [
-    "mlir::arith::ArithDialect",
-    "mlir::tensor::TensorDialect",
-    "mlir::func::FuncDialect",
-    "mlir::shard::ShardDialect"
-  ];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::tensor::TensorDialect",
+                           "mlir::func::FuncDialect",
+                           "mlir::shard::ShardDialect"];
 }
 
 #endif // HEXAGON_CONVERSION_SHARDTOLLVM_PASSES_TD

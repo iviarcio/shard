@@ -1,4 +1,5 @@
-//===- ShardToLLVMPass.cpp - Lower shard ops to arith/tensor ---------------===//
+//===- ShardToLLVMPass.cpp - Lower shard ops to arith/tensor
+//---------------===//
 //
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause.
@@ -65,8 +66,8 @@
 //         being reduced is not partitioned across shards), the reduction can
 //         remain local.
 //       * If the reduced dimension is partitioned across shards, the lowering
-//         must introduce a collective (e.g. shard.all_reduce) to combine partial
-//         reductions, followed by any necessary broadcasts.
+//         must introduce a collective (e.g. shard.all_reduce) to combine
+//         partial reductions, followed by any necessary broadcasts.
 //   - Collective ops such as shard.all_reduce are not lowered yet.
 //
 //===----------------------------------------------------------------------===//
@@ -137,26 +138,27 @@ static FailureOr<LinearIdxABI> resolveLinearIdxABIFromTail(func::FuncOp func) {
     return failure();
 
   LinearIdxABI abi;
-  abi.cid     = args[n - 2];
-  abi.tid     = args[n - 3];
-  abi.numCores= args[n - 5]; // not required for linearIdx, but kept for future use
-  abi.ntpc    = args[n - 6];
+  abi.cid = args[n - 2];
+  abi.tid = args[n - 3];
+  abi.numCores =
+      args[n - 5]; // not required for linearIdx, but kept for future use
+  abi.ntpc = args[n - 6];
 
   return abi;
 }
 
 /// Compute linear process id:
 ///   linearIdx = coreId * numThreadsPerCore + threadId
-static FailureOr<Value> computeLinearIdxFromFuncArgs(
-       func::FuncOp func, OpBuilder &b, Location loc) {
+static FailureOr<Value>
+computeLinearIdxFromFuncArgs(func::FuncOp func, OpBuilder &b, Location loc) {
   auto abiOrFail = resolveLinearIdxABIFromTail(func);
   if (failed(abiOrFail))
     return failure();
 
   LinearIdxABI abi = *abiOrFail;
 
-  Value cid  = castToIndexIfNeeded(abi.cid, b, loc);
-  Value tid  = castToIndexIfNeeded(abi.tid, b, loc);
+  Value cid = castToIndexIfNeeded(abi.cid, b, loc);
+  Value tid = castToIndexIfNeeded(abi.tid, b, loc);
   Value ntpc = castToIndexIfNeeded(abi.ntpc, b, loc);
 
   if (!cid || !tid || !ntpc)
@@ -171,7 +173,7 @@ static FailureOr<Value> computeLinearIdxFromFuncArgs(
 struct LowerProcessLinearIndex final : public RewritePattern {
   explicit LowerProcessLinearIndex(MLIRContext *ctx)
       : RewritePattern("shard.process_linear_index", /*benefit=*/1, ctx) {}
- 
+
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
     auto func = op->getParentOfType<func::FuncOp>();
@@ -186,7 +188,6 @@ struct LowerProcessLinearIndex final : public RewritePattern {
     rewriter.replaceOp(op, *linearIdxOrFail);
     return success();
   }
-
 };
 
 /// Lower shard.all_slice into tensor.extract_slice.
@@ -209,7 +210,7 @@ struct LowerAllSlice final : public RewritePattern {
       return failure();
 
     auto resultTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-    auto inputTy  = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto inputTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     if (!resultTy || !inputTy)
       return failure();
 
@@ -237,8 +238,7 @@ struct LowerAllSlice final : public RewritePattern {
     // offset = linearIdx * sliceSize
     Value sliceSizeVal =
         rewriter.create<arith::ConstantIndexOp>(loc, sliceSize);
-    Value offset =
-        rewriter.create<arith::MulIOp>(loc, linearIdx, sliceSizeVal);
+    Value offset = rewriter.create<arith::MulIOp>(loc, linearIdx, sliceSizeVal);
 
     // tensor.extract_slice %in[%offset] [%sliceSize] [1]
     SmallVector<OpFoldResult> offsets{offset};
@@ -246,13 +246,12 @@ struct LowerAllSlice final : public RewritePattern {
     SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1)};
 
     Value input = op->getOperand(0);
-    auto slice =
-        rewriter.create<tensor::ExtractSliceOp>(loc, resultTy, input, offsets, sizes, strides);
+    auto slice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, resultTy, input, offsets, sizes, strides);
 
     rewriter.replaceOp(op, slice.getResult());
     return success();
   }
-
 };
 
 /// Lower shard.shard.
@@ -270,7 +269,6 @@ struct LowerAllSlice final : public RewritePattern {
 struct LowerShardOp final : public RewritePattern {
   explicit LowerShardOp(MLIRContext *ctx)
       : RewritePattern("shard.shard", /*benefit=*/1, ctx) {}
-
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
@@ -375,7 +373,8 @@ struct ShardToLLVMPass : public ShardToLLVMBase<ShardToLLVMPass> {
     // Step 2: enforce that no shard ops remain.
     ConversionTarget target(*ctx);
     target.addIllegalDialect<shard::ShardDialect>();
-    target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect, func::FuncDialect>();
+    target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect,
+                           func::FuncDialect>();
     target.markUnknownOpDynamicallyLegal([](Operation *op) {
       return op->getName().getDialectNamespace() != StringRef("shard");
     });

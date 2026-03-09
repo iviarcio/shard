@@ -15,20 +15,14 @@
 //
 // Design goals:
 //   * Work at the "linalg.generic" level (pre-tiling).
-//   * Be dialect-agnostic except for using the shard dialect as the sharding IR.
+//   * Be dialect-agnostic except for using the shard dialect as the sharding
+//   IR.
 //   * Keep the pipeline compatible with further lowering to per-NSP slices
 //     (tensor.extract_slice/memref.subview) and runtime intrinsics.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Conversion/Passes.h"
-#include "mlir/Dialect/Shard/IR/ShardOps.h"
-#include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -36,8 +30,15 @@
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Shard/IR/ShardDialect.h"
+#include "mlir/Dialect/Shard/IR/ShardOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Pass/Pass.h"
 
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -69,8 +70,9 @@ struct ShardPolicy {
   // Prefer sharding along the first parallel iterator that indexes the output.
   bool preferFirstOutputParallelDim = true;
 
-  // If true, allow sharding decisions that introduce collectives (e.g. all-reduce).
-  // For initial release "no inter-NSP traffic" mode, so we keep this false.
+  // If true, allow sharding decisions that introduce collectives (e.g.
+  // all-reduce). For initial release "no inter-NSP traffic" mode, so we keep
+  // this false.
   bool allowCollectives = false;
 };
 
@@ -199,14 +201,15 @@ private:
   ///   * indexing_maps: which loop dims index which operands/results
   ///
   /// Heuristic:
-  ///   * Prefer a parallel iterator that appears as a direct dim in the output map.
+  ///   * Prefer a parallel iterator that appears as a direct dim in the output
+  ///   map.
   ///   * If sharding would shard a reduced dimension that must be aggregated,
   ///     mark requiresAllReduce=true.
   static FailureOr<ShardPlan> buildPlanForGeneric(linalg::GenericOp op,
-                                                 const ShardPolicy &policy) {
+                                                  const ShardPolicy &policy) {
     ShardPlan plan;
 
-    // Extract iterator types 
+    // Extract iterator types
     SmallVector<mlir::utils::IteratorType> iters;
     iters.reserve(op.getNumLoops());
     for (mlir::utils::IteratorType it : op.getIteratorTypesArray())
@@ -226,23 +229,24 @@ private:
 
     // Determine if this sharding requires a cross-NSP all-reduce.
     //
-    // If the shardIter corresponds to a reduction-only dimension of the final value,
-    // then each NSP computes partial results that need aggregation.
+    // If the shardIter corresponds to a reduction-only dimension of the final
+    // value, then each NSP computes partial results that need aggregation.
     //
     // For elementwise ops: false.
     // For matmul sharded on i or j: false (k is local reduction).
     // For global sum sharded on reduced axis: true.
-    plan.requiresAllReduce = shardingIntroducesGlobalReduction(op, plan.shardIter);
+    plan.requiresAllReduce =
+        shardingIntroducesGlobalReduction(op, plan.shardIter);
 
     return plan;
   }
 
   /// Decide which iterator to shard based on output map and iterator_types.
   /// \returns the loop iterator index, or -1 if no suitable iterator exists.
-  static int64_t pickShardIteratorIndex(
-      AffineMap outMap,
-      ArrayRef<mlir::utils::IteratorType> iteratorTypes,
-      const ShardPolicy &policy) {
+  static int64_t
+  pickShardIteratorIndex(AffineMap outMap,
+                         ArrayRef<mlir::utils::IteratorType> iteratorTypes,
+                         const ShardPolicy &policy) {
 
     // We want an iterator that:
     //   (1) is "parallel"
@@ -266,8 +270,7 @@ private:
   /// Return the set of loop iterator indices used by an affine map result list.
   /// We only consider direct AffineDimExpr (no affine.apply or arithmetic),
   /// keeping this intentionally conservative.
-  static llvm::SmallDenseSet<int64_t>
-  collectLoopItersUsedByMap(AffineMap map) {
+  static llvm::SmallDenseSet<int64_t> collectLoopItersUsedByMap(AffineMap map) {
     llvm::SmallDenseSet<int64_t> used;
     for (AffineExpr e : map.getResults()) {
       if (auto d = dyn_cast<AffineDimExpr>(e))
@@ -288,12 +291,10 @@ private:
   ///   iterators: [parallel, parallel, reduction]
   ///   maps: A(i,k), B(k,j), C(i,j)
   ///
-  /// This is meant to catch the common linalg.generic that came from matmul-like
-  /// lowering (or hand-written).
-  static bool matchMatmulLike(linalg::GenericOp op,
-                              int64_t &iIter,
-                              int64_t &jIter,
-                              int64_t &kIter) {
+  /// This is meant to catch the common linalg.generic that came from
+  /// matmul-like lowering (or hand-written).
+  static bool matchMatmulLike(linalg::GenericOp op, int64_t &iIter,
+                              int64_t &jIter, int64_t &kIter) {
     auto iters = op.getIteratorTypesArray();
     if (iters.size() < 3)
       return false;
@@ -313,7 +314,8 @@ private:
     if (parallelIters.size() != 2 || reductionIters.size() != 1)
       return false;
 
-    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    // Wrap the generic op with the LinalgOp interface to access common Linalg
+    // helpers.
     linalg::LinalgOp linalgOp(op);
 
     // Must have at least 2 inputs + 1 output for matmul-like.
@@ -352,10 +354,14 @@ private:
 
     // A must use (one parallel) + (reduction)
     // B must use (other parallel) + (reduction)
-    bool aIs_p0_r = aUsed.contains(p0) && aUsed.contains(r0) && !aUsed.contains(p1);
-    bool aIs_p1_r = aUsed.contains(p1) && aUsed.contains(r0) && !aUsed.contains(p0);
-    bool bIs_p0_r = bUsed.contains(p0) && bUsed.contains(r0) && !bUsed.contains(p1);
-    bool bIs_p1_r = bUsed.contains(p1) && bUsed.contains(r0) && !bUsed.contains(p0);
+    bool aIs_p0_r =
+        aUsed.contains(p0) && aUsed.contains(r0) && !aUsed.contains(p1);
+    bool aIs_p1_r =
+        aUsed.contains(p1) && aUsed.contains(r0) && !aUsed.contains(p0);
+    bool bIs_p0_r =
+        bUsed.contains(p0) && bUsed.contains(r0) && !bUsed.contains(p1);
+    bool bIs_p1_r =
+        bUsed.contains(p1) && bUsed.contains(r0) && !bUsed.contains(p0);
 
     if (aIs_p0_r && bIs_p1_r) {
       iIter = p0;
@@ -373,14 +379,16 @@ private:
     return false;
   }
 
-  /// Determine whether sharding on `shardIter` forces an all-reduce for correctness.
+  /// Determine whether sharding on `shardIter` forces an all-reduce for
+  /// correctness.
   ///
-  /// This is intentionally conservative. A production implementation should understand:
+  /// This is intentionally conservative. A production implementation should
+  /// understand:
   ///   * how results are used downstream
   ///   * whether the result is expected to be replicated or sharded
   ///   * whether reductions are local vs global
   static bool shardingIntroducesGlobalReduction(linalg::GenericOp op,
-                                               int64_t shardIter) {
+                                                int64_t shardIter) {
     // Scalar Result Heuristic: scalar reductions are typically global.
     // -----------------------
     // If the op returns a scalar (rank-0) and any loop is sharded, it's likely
@@ -392,38 +400,42 @@ private:
       }
     }
 
-    // For typical matmul-like patterns, sharding on i/j does not need all-reduce.
-    // We can recognize matmul by iterator types and maps:
+    // For typical matmul-like patterns, sharding on i/j does not need
+    // all-reduce. We can recognize matmul by iterator types and maps:
     //   iterators: [parallel, parallel, reduction]
     //   maps: A(i,k), B(k,j), C(i,j)
     // If shardIter is one of the parallel iters that index C, return false.
 
     // Fast-path: recognize matmul-like contraction.
     // ---------
-    // Sharding on i or j (the parallel iters that index C) is safe (no all-reduce).
-    // Sharding on k (the reduction iter) would require reduction across shards.
+    // Sharding on i or j (the parallel iters that index C) is safe (no
+    // all-reduce). Sharding on k (the reduction iter) would require reduction
+    // across shards.
     int64_t iIter = -1, jIter = -1, kIter = -1;
     if (matchMatmulLike(op, iIter, jIter, kIter)) {
       if (shardIter == iIter || shardIter == jIter)
         return false;
       if (shardIter == kIter)
         return true;
-      // If shardIter is something else (shouldn't happen in strict match), be conservative.
+      // If shardIter is something else (shouldn't happen in strict match), be
+      // conservative.
       return true;
     }
 
-    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    // Wrap the generic op with the LinalgOp interface to access common Linalg
+    // helpers.
     linalg::LinalgOp linalgOp(op);
 
     // Conservative fallback:
     // ---------------------
-    // If shardIter is a reduction iterator, it often implies each shard computes a
-    // partial reduction that must be combined globally.
+    // If shardIter is a reduction iterator, it often implies each shard
+    // computes a partial reduction that must be combined globally.
     //
-    // We make it slightly less trigger-happy by checking whether the output indexing
-    // map depends on shardIter. If the output depends on shardIter, then sharding that
-    // iter changes which output elements are produced by each shard (more like
-    // partitioning the output) and may not require all-reduce.
+    // We make it slightly less trigger-happy by checking whether the output
+    // indexing map depends on shardIter. If the output depends on shardIter,
+    // then sharding that iter changes which output elements are produced by
+    // each shard (more like partitioning the output) and may not require
+    // all-reduce.
     auto iters = op.getIteratorTypesArray();
     if (shardIter >= 0 && shardIter < (int64_t)iters.size() &&
         iters[shardIter] == utils::IteratorType::reduction) {
@@ -433,7 +445,8 @@ private:
         AffineMap outMap = maps[linalgOp.getNumDpsInputs() + 0];
         auto outUsed = collectLoopItersUsedByMap(outMap);
         // If the output does not depend on the sharded reduction iter,
-        // then shards are computing partial sums for the same output -> needs all-reduce.
+        // then shards are computing partial sums for the same output -> needs
+        // all-reduce.
         if (!outUsed.contains(shardIter))
           return true;
       }
@@ -443,10 +456,10 @@ private:
 
     // Another Conservative Heuristic:
     // ------------------------------
-    // If the op has any reduction iterator at all, and we shard a parallel iterator
-    // that does NOT appear in the output map, we are probably partitioning a reduced
-    // dimension (i.e. different shards reduce different slices but to the same output),
-    // which requires all-reduce.
+    // If the op has any reduction iterator at all, and we shard a parallel
+    // iterator that does NOT appear in the output map, we are probably
+    // partitioning a reduced dimension (i.e. different shards reduce different
+    // slices but to the same output), which requires all-reduce.
     bool hasReduction = llvm::any_of(iters, [](utils::IteratorType t) {
       return t == utils::IteratorType::reduction;
     });
@@ -525,8 +538,9 @@ private:
     ///
     /// Even if all dimensions are replicated, an explicit rank-sized array
     /// is returned.
-    auto buildSplitAxesForOperand = [&](AffineMap map,
-                                        RankedTensorType rtt) -> SmallVector<shard::GridAxesAttr> {
+    auto buildSplitAxesForOperand =
+        [&](AffineMap map,
+            RankedTensorType rtt) -> SmallVector<shard::GridAxesAttr> {
       SmallVector<shard::GridAxesAttr> perDimAxes;
       perDimAxes.reserve(rtt.getRank());
 
@@ -569,7 +583,8 @@ private:
     ///    an empty Value is returned.
     ///  - Otherwise, the operand's indexing map is analyzed to compute
     ///    `split_axes` via `buildSplitAxesForOperand`.
-    ///  - A `shard::ShardingOp` is created referencing the provided grid symbol.
+    ///  - A `shard::ShardingOp` is created referencing the provided grid
+    ///  symbol.
     ///
     /// Halo sizes and per-dimension offsets are intentionally left empty;
     /// they are not inferred at this stage of planning.
@@ -582,7 +597,8 @@ private:
         return Value();
 
       // Build split_axes = [ GridAxesAttr, GridAxesAttr, ... ] (rank entries).
-      SmallVector<shard::GridAxesAttr> splitAxes = buildSplitAxesForOperand(map, rtt);
+      SmallVector<shard::GridAxesAttr> splitAxes =
+          buildSplitAxesForOperand(map, rtt);
 
       // shard.sharding takes a symbol ref to the grid (e.g. @nsp).
       auto gridRef = FlatSymbolRefAttr::get(grid.getSymNameAttr());
@@ -606,7 +622,8 @@ private:
     // Indexing maps are ordered as: inputs..., outputs...
     auto maps = op.getIndexingMapsArray();
 
-    // Wrap the generic op with the LinalgOp interface to access common Linalg helpers.
+    // Wrap the generic op with the LinalgOp interface to access common Linalg
+    // helpers.
     linalg::LinalgOp linalgOp(op);
 
     // Wrap each tensor input with shard.shard.
@@ -620,12 +637,11 @@ private:
         newInputs.push_back(in);
         continue;
       }
-      auto shardOp = b.create<shard::ShardOp>(
-          loc,
-          in.getType(),
-          /*src=*/in,
-          /*sharding=*/shardingVal,
-          /*annotate_for_users=*/UnitAttr::get(ctx));
+      auto shardOp =
+          b.create<shard::ShardOp>(loc, in.getType(),
+                                   /*src=*/in,
+                                   /*sharding=*/shardingVal,
+                                   /*annotate_for_users=*/UnitAttr::get(ctx));
       newInputs.push_back(shardOp.getResult());
     }
 
@@ -635,16 +651,19 @@ private:
     for (unsigned oi = 0; oi < linalgOp.getNumDpsInits(); ++oi) {
       Value out = op.getOutputs()[oi];
 
-      // The 'outs' operands of linalg.generic are *init tensors* (destination-style).
-      // They must match the result type and be suitable for SPMD partitioning.
+      // The 'outs' operands of linalg.generic are *init tensors*
+      // (destination-style). They must match the result type and be suitable
+      // for SPMD partitioning.
       //
-      // Some early pipelines produce linalg.generic with outs accidentally tied to an
-      // input tensor (e.g. a read-modify-write pattern over the input). This breaks
-      // shard-partition: the pass localizes the result type (per-shard tile), but the
-      // outs operand remains global, triggering verifier errors.
+      // Some early pipelines produce linalg.generic with outs accidentally tied
+      // to an input tensor (e.g. a read-modify-write pattern over the input).
+      // This breaks shard-partition: the pass localizes the result type
+      // (per-shard tile), but the outs operand remains global, triggering
+      // verifier errors.
       //
-      // Fix-up: if an outs operand aliases an input, synthesize a fresh init tensor
-      // (tensor.empty) with the same type as the corresponding op result.
+      // Fix-up: if an outs operand aliases an input, synthesize a fresh init
+      // tensor (tensor.empty) with the same type as the corresponding op
+      // result.
       auto aliasesAnyInput = [&]() -> bool {
         for (Value in : op.getInputs())
           if (in == out)
@@ -658,14 +677,15 @@ private:
           SmallVector<Value> dynSizes;
           dynSizes.reserve(resTy.getNumDynamicDims());
 
-          // For dynamic dimensions, use tensor.dim on the first input as a size source.
-          // This is safe for elementwise ops where shapes are expected to match.
+          // For dynamic dimensions, use tensor.dim on the first input as a size
+          // source. This is safe for elementwise ops where shapes are expected
+          // to match.
           Value sizeSource =
-             !op.getInputs().empty() ? op.getInputs().front() : Value();
+              !op.getInputs().empty() ? op.getInputs().front() : Value();
           for (int64_t d = 0, e = resTy.getRank(); d < e; ++d) {
             if (resTy.isDynamicDim(d)) {
-              // If we don't have a size source, we can't build a well-formed empty.
-              // Keep the original outs in that (rare) case.
+              // If we don't have a size source, we can't build a well-formed
+              // empty. Keep the original outs in that (rare) case.
               if (!sizeSource)
                 break;
               dynSizes.push_back(b.create<tensor::DimOp>(loc, sizeSource, d));
@@ -673,7 +693,7 @@ private:
           }
           if ((int64_t)dynSizes.size() == resTy.getNumDynamicDims()) {
             out = b.create<tensor::EmptyOp>(loc, resTy.getShape(),
-                                           resTy.getElementType(), dynSizes);
+                                            resTy.getElementType(), dynSizes);
           }
         }
       }
@@ -684,12 +704,11 @@ private:
         newOutputs.push_back(out);
         continue;
       }
-      auto shardOp = b.create<shard::ShardOp>(
-          loc,
-          out.getType(),
-          /*src=*/out,
-          /*sharding=*/shardingVal,
-          /*annotate_for_users=*/UnitAttr::get(ctx));
+      auto shardOp =
+          b.create<shard::ShardOp>(loc, out.getType(),
+                                   /*src=*/out,
+                                   /*sharding=*/shardingVal,
+                                   /*annotate_for_users=*/UnitAttr::get(ctx));
       newOutputs.push_back(shardOp.getResult());
     }
 
@@ -704,18 +723,18 @@ private:
     SmallVector<AffineMap> indexingMaps(op.getIndexingMapsArray());
     SmallVector<utils::IteratorType> iteratorTypes(op.getIteratorTypesArray());
 
-    auto newOp = b.create<linalg::GenericOp>(
-        loc,
-        op->getResultTypes(),
-        /*inputs=*/newInputs,
-        /*outputs=*/newOutputs,
-        /*indexingMaps=*/indexingMaps,
-        /*iteratorTypes=*/iteratorTypes);
+    auto newOp = b.create<linalg::GenericOp>(loc, op->getResultTypes(),
+                                             /*inputs=*/newInputs,
+                                             /*outputs=*/newOutputs,
+                                             /*indexingMaps=*/indexingMaps,
+                                             /*iteratorTypes=*/iteratorTypes);
 
     // Preserve any extra attributes on the original generic op.
-    // Avoid overwriting the structural attributes that define the generic itself.
+    // Avoid overwriting the structural attributes that define the generic
+    // itself.
     auto indexingMapsName = StringAttr::get(op->getContext(), "indexing_maps");
-    auto iteratorTypesName = StringAttr::get(op->getContext(), "iterator_types");
+    auto iteratorTypesName =
+        StringAttr::get(op->getContext(), "iterator_types");
     for (auto na : op->getAttrs()) {
       auto name = na.getName();
       if (name == indexingMapsName || name == iteratorTypesName)
@@ -736,9 +755,10 @@ private:
   /// Insert an all-reduce if the sharding plan requires it.
   ///
   /// This is relevant for global reductions (e.g. sum-reduction) where each
-  /// NSP produces a partial result and the program expects a replicated final value.
+  /// NSP produces a partial result and the program expects a replicated final
+  /// value.
   static void materializeAllReduceIfNeeded(linalg::GenericOp op,
-                                          const ShardPlan &plan) {
+                                           const ShardPlan &plan) {
     // Skeleton:
     //  * Identify the value that represents the partial reduction.
     //  * Insert shard.all_reduce with op="add" (or other reduction kind).

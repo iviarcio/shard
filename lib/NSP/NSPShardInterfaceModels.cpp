@@ -86,13 +86,15 @@ static bool hasRankedShapedType(Operation *op) {
   return false;
 }
 
-static SmallVector<AffineMap> makeIdentityMapsForOp(Operation *op, int64_t rank) {
+static SmallVector<AffineMap> makeIdentityMapsForOp(Operation *op,
+                                                    int64_t rank) {
   MLIRContext *ctx = op->getContext();
   AffineMap id = AffineMap::getMultiDimIdentityMap(rank, ctx);
 
   SmallVector<AffineMap> maps;
   maps.reserve(op->getNumOperands() + op->getNumResults());
-  for (unsigned i = 0, e = op->getNumOperands() + op->getNumResults(); i < e; ++i)
+  for (unsigned i = 0, e = op->getNumOperands() + op->getNumResults(); i < e;
+       ++i)
     maps.push_back(id);
   return maps;
 }
@@ -155,7 +157,8 @@ static shard::Sharding fromShardingOption(Operation *op,
 }
 
 /// Create a ShardingOption corresponding to a specific value sharding.
-static FailureOr<shard::ShardingOption> makeValueShardingOption(shard::Sharding s) {
+static FailureOr<shard::ShardingOption>
+makeValueShardingOption(shard::Sharding s) {
   if (!s)
     return shard::ShardingOption::makeEmpty();
   return shard::ShardingOption(toShardingArray(s), s.getGridAttr());
@@ -184,19 +187,25 @@ static LogicalResult partitionByCloning(Operation *op,
 // Generic models
 //===----------------------------------------------------------------------===//
 
-/// Generic model for scalar/control-flow ops that should not participate in sharding.
-/// It tells shard-propagation to ignore the op instead of erroring out.
+/// Generic model for scalar/control-flow ops that should not participate in
+/// sharding. It tells shard-propagation to ignore the op instead of erroring
+/// out.
 template <typename OpTy>
 struct NoShardingModel
-    : public shard::ShardingInterface::ExternalModel<NoShardingModel<OpTy>, OpTy> {
-  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *) const { return {}; }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
+    : public shard::ShardingInterface::ExternalModel<NoShardingModel<OpTy>,
+                                                     OpTy> {
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *) const {
+    return {};
+  }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
   SmallVector<AffineMap> getIndexingMaps(Operation *) const { return {}; }
 
   FailureOr<shard::ShardingOption>
-  getShardingOption(Operation *, ArrayRef<shard::Sharding>, ArrayRef<shard::Sharding>) const {
+  getShardingOption(Operation *, ArrayRef<shard::Sharding>,
+                    ArrayRef<shard::Sharding>) const {
     return shard::ShardingOption::makeEmpty();
   }
 
@@ -208,7 +217,7 @@ struct NoShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -225,7 +234,8 @@ struct NoShardingModel
 /// For pure scalars, behave like NoShardingModel (empty info).
 template <typename OpTy>
 struct ElementwiseShardingModel
-    : public shard::ShardingInterface::ExternalModel<ElementwiseShardingModel<OpTy>, OpTy> {
+    : public shard::ShardingInterface::ExternalModel<
+          ElementwiseShardingModel<OpTy>, OpTy> {
 
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     if (!hasRankedShapedType(op))
@@ -241,7 +251,8 @@ struct ElementwiseShardingModel
     return makeParallelIters(rank);
   }
 
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
 
@@ -266,7 +277,8 @@ struct ElementwiseShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     std::vector<shard::Sharding> res;
     res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
 
@@ -282,7 +294,7 @@ struct ElementwiseShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     // Elementwise ops do not need explicit shard ops inserted.
     return success();
   }
@@ -298,8 +310,8 @@ struct ElementwiseShardingModel
 /// Result-only model for ops with 0 operands and (typically) 1 result.
 /// Useful for tensor constants: accept a proposed result sharding when present.
 template <typename OpTy>
-struct ResultOnlyShardingModel
-    : public shard::ShardingInterface::ExternalModel<ResultOnlyShardingModel<OpTy>, OpTy> {
+struct ResultOnlyShardingModel : public shard::ShardingInterface::ExternalModel<
+                                     ResultOnlyShardingModel<OpTy>, OpTy> {
 
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     if (!hasRankedShapedType(op))
@@ -315,7 +327,8 @@ struct ResultOnlyShardingModel
     return makeParallelIters(rank);
   }
 
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const {
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
     return {};
   }
 
@@ -332,7 +345,8 @@ struct ResultOnlyShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     std::vector<shard::Sharding> res;
     res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
 
@@ -347,7 +361,7 @@ struct ResultOnlyShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -364,8 +378,8 @@ struct ResultOnlyShardingModel
 //===----------------------------------------------------------------------===//
 
 struct ReinterpretCastShardingModel
-    : public shard::ShardingInterface::ExternalModel<ReinterpretCastShardingModel,
-                                                    memref::ReinterpretCastOp> {
+    : public shard::ShardingInterface::ExternalModel<
+          ReinterpretCastShardingModel, memref::ReinterpretCastOp> {
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     int64_t rank = getFirstRankedShapedRank(op);
     return makeIdentityMapsForOp(op, rank);
@@ -374,7 +388,10 @@ struct ReinterpretCastShardingModel
     int64_t rank = getFirstRankedShapedRank(op);
     return makeParallelIters(rank);
   }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const { return {}; }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
 
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
@@ -390,7 +407,8 @@ struct ReinterpretCastShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     int64_t rank = getFirstRankedShapedRank(op);
     shard::Sharding s = fromShardingOption(op, opt, rank);
 
@@ -402,7 +420,7 @@ struct ReinterpretCastShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -415,7 +433,8 @@ struct ReinterpretCastShardingModel
 };
 
 struct AllocShardingModel
-    : public shard::ShardingInterface::ExternalModel<AllocShardingModel, memref::AllocOp> {
+    : public shard::ShardingInterface::ExternalModel<AllocShardingModel,
+                                                     memref::AllocOp> {
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     int64_t rank = getFirstRankedShapedRank(op);
     return makeIdentityMapsForOp(op, rank);
@@ -424,7 +443,10 @@ struct AllocShardingModel
     int64_t rank = getFirstRankedShapedRank(op);
     return makeParallelIters(rank);
   }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const { return {}; }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
 
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding>,
@@ -439,7 +461,8 @@ struct AllocShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     int64_t rank = getFirstRankedShapedRank(op);
     shard::Sharding s = fromShardingOption(op, opt, rank);
 
@@ -450,7 +473,7 @@ struct AllocShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -463,7 +486,8 @@ struct AllocShardingModel
 };
 
 struct CopyShardingModel
-    : public shard::ShardingInterface::ExternalModel<CopyShardingModel, memref::CopyOp> {
+    : public shard::ShardingInterface::ExternalModel<CopyShardingModel,
+                                                     memref::CopyOp> {
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     int64_t rank = getFirstRankedShapedRank(op);
     return makeIdentityMapsForOp(op, rank);
@@ -472,7 +496,10 @@ struct CopyShardingModel
     int64_t rank = getFirstRankedShapedRank(op);
     return makeParallelIters(rank);
   }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const { return {}; }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
 
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
@@ -490,7 +517,8 @@ struct CopyShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     int64_t rank = getFirstRankedShapedRank(op);
     shard::Sharding s = fromShardingOption(op, opt, rank);
 
@@ -502,7 +530,7 @@ struct CopyShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -519,8 +547,8 @@ struct CopyShardingModel
 //===----------------------------------------------------------------------===//
 
 struct ToTensorShardingModel
-    : public shard::ShardingInterface::ExternalModel<ToTensorShardingModel,
-                                                    bufferization::ToTensorOp> {
+    : public shard::ShardingInterface::ExternalModel<
+          ToTensorShardingModel, bufferization::ToTensorOp> {
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     int64_t rank = getFirstRankedShapedRank(op);
     return makeIdentityMapsForOp(op, rank);
@@ -529,7 +557,10 @@ struct ToTensorShardingModel
     int64_t rank = getFirstRankedShapedRank(op);
     return makeParallelIters(rank);
   }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const { return {}; }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
 
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding>,
@@ -544,7 +575,8 @@ struct ToTensorShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     int64_t rank = getFirstRankedShapedRank(op);
     shard::Sharding s = fromShardingOption(op, opt, rank);
 
@@ -556,7 +588,7 @@ struct ToTensorShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -569,8 +601,9 @@ struct ToTensorShardingModel
 };
 
 struct MaterializeInDestShardingModel
-    : public shard::ShardingInterface::ExternalModel<MaterializeInDestShardingModel,
-                                                    bufferization::MaterializeInDestinationOp> {
+    : public shard::ShardingInterface::ExternalModel<
+          MaterializeInDestShardingModel,
+          bufferization::MaterializeInDestinationOp> {
   SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
     int64_t rank = getFirstRankedShapedRank(op);
     return makeIdentityMapsForOp(op, rank);
@@ -579,7 +612,10 @@ struct MaterializeInDestShardingModel
     int64_t rank = getFirstRankedShapedRank(op);
     return makeParallelIters(rank);
   }
-  SmallVector<shard::ReductionKind> getReductionLoopIteratorKinds(Operation *) const { return {}; }
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
 
   FailureOr<shard::ShardingOption>
   getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
@@ -595,13 +631,15 @@ struct MaterializeInDestShardingModel
   }
 
   FailureOr<std::vector<shard::Sharding>>
-  getShardingAnnotations(Operation *op, const shard::ShardingOption &opt) const {
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
     int64_t rank = getFirstRankedShapedRank(op);
     shard::Sharding s = fromShardingOption(op, opt, rank);
 
     std::vector<shard::Sharding> res;
     res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
-    // Both operands get the same logical sharding info (tensor + destination memref).
+    // Both operands get the same logical sharding info (tensor + destination
+    // memref).
     if (res.size() >= 2) {
       res[0] = s;
       res[1] = s;
@@ -610,7 +648,7 @@ struct MaterializeInDestShardingModel
   }
 
   LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
-                                      const shard::ShardingOption &) const {
+                                       const shard::ShardingOption &) const {
     return success();
   }
 
@@ -637,18 +675,20 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
   // Memref boundaries / structural ops.
   registry.addExtension(+[](MLIRContext *ctx, memref::MemRefDialect *dialect) {
     (void)dialect;
-    memref::ReinterpretCastOp::attachInterface<ReinterpretCastShardingModel>(*ctx);
+    memref::ReinterpretCastOp::attachInterface<ReinterpretCastShardingModel>(
+        *ctx);
     memref::AllocOp::attachInterface<AllocShardingModel>(*ctx);
     memref::CopyOp::attachInterface<CopyShardingModel>(*ctx);
   });
 
   // Bufferization boundaries.
-  registry.addExtension(+[](MLIRContext *ctx, bufferization::BufferizationDialect *dialect) {
-    (void)dialect;
-    bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
-    bufferization::MaterializeInDestinationOp::attachInterface<
-        MaterializeInDestShardingModel>(*ctx);
-  });
+  registry.addExtension(
+      +[](MLIRContext *ctx, bufferization::BufferizationDialect *dialect) {
+        (void)dialect;
+        bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
+        bufferization::MaterializeInDestinationOp::attachInterface<
+            MaterializeInDestShardingModel>(*ctx);
+      });
 
   // Control-flow (modeled as sharding-transparent for now).
   registry.addExtension(+[](MLIRContext *ctx, scf::SCFDialect *dialect) {
@@ -662,20 +702,29 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
     (void)dialect;
 
     // Constants may produce tensors; accept proposed result sharding.
-    arith::ConstantOp::attachInterface<ResultOnlyShardingModel<arith::ConstantOp>>(*ctx);
+    arith::ConstantOp::attachInterface<
+        ResultOnlyShardingModel<arith::ConstantOp>>(*ctx);
 
     // Casts / loop-bound plumbing ops (scalar/control oriented).
-    arith::IndexCastOp::attachInterface<NoShardingModel<arith::IndexCastOp>>(*ctx);
+    arith::IndexCastOp::attachInterface<NoShardingModel<arith::IndexCastOp>>(
+        *ctx);
 
     // Elementwise (works for tensors; becomes "empty" for scalars).
-    arith::AddFOp::attachInterface<ElementwiseShardingModel<arith::AddFOp>>(*ctx);
-    arith::SubFOp::attachInterface<ElementwiseShardingModel<arith::SubFOp>>(*ctx);
-    arith::MulFOp::attachInterface<ElementwiseShardingModel<arith::MulFOp>>(*ctx);
-    arith::DivFOp::attachInterface<ElementwiseShardingModel<arith::DivFOp>>(*ctx);
+    arith::AddFOp::attachInterface<ElementwiseShardingModel<arith::AddFOp>>(
+        *ctx);
+    arith::SubFOp::attachInterface<ElementwiseShardingModel<arith::SubFOp>>(
+        *ctx);
+    arith::MulFOp::attachInterface<ElementwiseShardingModel<arith::MulFOp>>(
+        *ctx);
+    arith::DivFOp::attachInterface<ElementwiseShardingModel<arith::DivFOp>>(
+        *ctx);
 
-    arith::AddIOp::attachInterface<ElementwiseShardingModel<arith::AddIOp>>(*ctx);
-    arith::SubIOp::attachInterface<ElementwiseShardingModel<arith::SubIOp>>(*ctx);
-    arith::MulIOp::attachInterface<ElementwiseShardingModel<arith::MulIOp>>(*ctx);
+    arith::AddIOp::attachInterface<ElementwiseShardingModel<arith::AddIOp>>(
+        *ctx);
+    arith::SubIOp::attachInterface<ElementwiseShardingModel<arith::SubIOp>>(
+        *ctx);
+    arith::MulIOp::attachInterface<ElementwiseShardingModel<arith::MulIOp>>(
+        *ctx);
 
     // Add more as they appear.
   });
