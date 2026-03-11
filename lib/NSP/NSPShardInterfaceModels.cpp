@@ -543,8 +543,83 @@ struct CopyShardingModel
 };
 
 //===----------------------------------------------------------------------===//
-// bufferization.to_tensor / bufferization.materialize_in_destination
+// bufferization.alloc_tensor / bufferization.to_tensor /
+// bufferization.materialize_in_destination
 //===----------------------------------------------------------------------===//
+
+struct AllocTensorShardingModel
+    : public shard::ShardingInterface::ExternalModel<
+          AllocTensorShardingModel, bufferization::AllocTensorOp> {
+
+  SmallVector<AffineMap> getIndexingMaps(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeIdentityMapsForOp(op, rank);
+  }
+
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
+    int64_t rank = getFirstRankedShapedRank(op);
+    return makeParallelIters(rank);
+  }
+
+  SmallVector<shard::ReductionKind>
+  getReductionLoopIteratorKinds(Operation *) const {
+    return {};
+  }
+
+  FailureOr<shard::ShardingOption>
+  getShardingOption(Operation *op,
+                    ArrayRef<shard::Sharding> operandShardings,
+                    ArrayRef<shard::Sharding> resultShardings) const {
+
+    auto alloc = cast<bufferization::AllocTensorOp>(op);
+
+    // If alloc_tensor copies from another tensor, inherit its sharding.
+    if (alloc.getCopy() && !operandShardings.empty()) {
+      unsigned copyIdx = alloc.getCopyMutable().getOperandNumber();
+      if (copyIdx < operandShardings.size() && operandShardings[copyIdx])
+        return makeValueShardingOption(operandShardings[copyIdx]);
+    }
+
+    // Otherwise accept proposed result sharding.
+    if (!resultShardings.empty() && resultShardings[0])
+      return makeValueShardingOption(resultShardings[0]);
+
+    return shard::ShardingOption::makeEmpty();
+  }
+
+  FailureOr<std::vector<shard::Sharding>>
+  getShardingAnnotations(Operation *op,
+                         const shard::ShardingOption &opt) const {
+
+    int64_t rank = getFirstRankedShapedRank(op);
+    shard::Sharding s = fromShardingOption(op, opt, rank);
+
+    std::vector<shard::Sharding> res;
+    res.resize(op->getNumOperands() + op->getNumResults(), shard::Sharding());
+
+    // Only annotate the result tensor.
+    if (!res.empty())
+      res.back() = s;
+
+    return res;
+  }
+
+  LogicalResult addShardingAnnotations(Operation *,
+                                       OpBuilder &,
+                                       const shard::ShardingOption &) const {
+    return success();
+  }
+
+  LogicalResult partition(Operation *op,
+                          ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding>,
+                          ArrayRef<shard::Sharding>,
+                          IRMapping &partitionMap,
+                          SymbolTableCollection &,
+                          OpBuilder &builder) const {
+    return partitionByCloning(op, partitionedOperands, partitionMap, builder);
+  }
+};
 
 struct ToTensorShardingModel
     : public shard::ShardingInterface::ExternalModel<
@@ -685,6 +760,7 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
   registry.addExtension(
       +[](MLIRContext *ctx, bufferization::BufferizationDialect *dialect) {
         (void)dialect;
+        bufferization::AllocTensorOp::attachInterface<AllocTensorShardingModel>(*ctx);
         bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
         bufferization::MaterializeInDestinationOp::attachInterface<
             MaterializeInDestShardingModel>(*ctx);
