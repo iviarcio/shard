@@ -567,17 +567,20 @@ struct AllocTensorShardingModel
   }
 
   FailureOr<shard::ShardingOption>
-  getShardingOption(Operation *op,
-                    ArrayRef<shard::Sharding> operandShardings,
+  getShardingOption(Operation *op, ArrayRef<shard::Sharding> operandShardings,
                     ArrayRef<shard::Sharding> resultShardings) const {
 
     auto alloc = cast<bufferization::AllocTensorOp>(op);
 
     // If alloc_tensor copies from another tensor, inherit its sharding.
-    if (alloc.getCopy() && !operandShardings.empty()) {
-      unsigned copyIdx = alloc.getCopyMutable().getOperandNumber();
-      if (copyIdx < operandShardings.size() && operandShardings[copyIdx])
-        return makeValueShardingOption(operandShardings[copyIdx]);
+    if (Value copy = alloc.getCopy()) {
+      for (auto [idx, operand] : llvm::enumerate(op->getOperands())) {
+        if (operand == copy) {
+          if (idx < operandShardings.size() && operandShardings[idx])
+            return makeValueShardingOption(operandShardings[idx]);
+          break;
+        }
+      }
     }
 
     // Otherwise accept proposed result sharding.
@@ -604,18 +607,14 @@ struct AllocTensorShardingModel
     return res;
   }
 
-  LogicalResult addShardingAnnotations(Operation *,
-                                       OpBuilder &,
+  LogicalResult addShardingAnnotations(Operation *, OpBuilder &,
                                        const shard::ShardingOption &) const {
     return success();
   }
 
-  LogicalResult partition(Operation *op,
-                          ArrayRef<Value> partitionedOperands,
-                          ArrayRef<shard::Sharding>,
-                          ArrayRef<shard::Sharding>,
-                          IRMapping &partitionMap,
-                          SymbolTableCollection &,
+  LogicalResult partition(Operation *op, ArrayRef<Value> partitionedOperands,
+                          ArrayRef<shard::Sharding>, ArrayRef<shard::Sharding>,
+                          IRMapping &partitionMap, SymbolTableCollection &,
                           OpBuilder &builder) const {
     return partitionByCloning(op, partitionedOperands, partitionMap, builder);
   }
@@ -760,7 +759,8 @@ void registerNSPShardInterfaceModels(DialectRegistry &registry) {
   registry.addExtension(
       +[](MLIRContext *ctx, bufferization::BufferizationDialect *dialect) {
         (void)dialect;
-        bufferization::AllocTensorOp::attachInterface<AllocTensorShardingModel>(*ctx);
+        bufferization::AllocTensorOp::attachInterface<AllocTensorShardingModel>(
+            *ctx);
         bufferization::ToTensorOp::attachInterface<ToTensorShardingModel>(*ctx);
         bufferization::MaterializeInDestinationOp::attachInterface<
             MaterializeInDestShardingModel>(*ctx);
