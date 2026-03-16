@@ -118,7 +118,12 @@ struct LinearIdxABI {
   Value cid;
   Value tid;
   Value ntpc;
-  Value numCores; // optional
+  Value numCores;
+};
+
+struct Local1DSliceInfo {
+  Value offset;
+  Value size;
 };
 
 static Value castToIndexIfNeeded(Value v, OpBuilder &b, Location loc) {
@@ -190,6 +195,49 @@ struct LowerProcessLinearIndex final : public RewritePattern {
   }
 };
 
+static FailureOr<int64_t> resolveNumShardsFromModule(Operation *op) {
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  if (!module)
+    return failure();
+
+  auto grid = module.lookupSymbol<shard::GridOp>("nsp");
+  if (!grid)
+    return failure();
+
+  auto shape = grid.getShape();
+  if (shape.empty() || shape.front() <= 0)
+    return failure();
+
+  return shape.front();
+}
+
+static FailureOr<Local1DSliceInfo>
+computeLocal1DSliceInfo(Location loc, Value linearIdx, int64_t globalDim,
+                        int64_t numShards, PatternRewriter &rewriter) {
+  if (globalDim <= 0 || numShards <= 0)
+    return failure();
+
+  Value cBase =
+      rewriter.create<arith::ConstantIndexOp>(loc, globalDim / numShards);
+  Value cRem =
+      rewriter.create<arith::ConstantIndexOp>(loc, globalDim % numShards);
+  Value cZero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value cOne = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+  Value isRemainderShard = rewriter.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::ult, linearIdx, cRem);
+  Value extra =
+      rewriter.create<arith::SelectOp>(loc, isRemainderShard, cOne, cZero);
+  Value size = rewriter.create<arith::AddIOp>(loc, cBase, extra);
+
+  Value minPidRem =
+      rewriter.create<arith::SelectOp>(loc, isRemainderShard, linearIdx, cRem);
+  Value scaledPid = rewriter.create<arith::MulIOp>(loc, linearIdx, cBase);
+  Value offset = rewriter.create<arith::AddIOp>(loc, scaledPid, minPidRem);
+
+  return Local1DSliceInfo{offset, size};
+}
+
 /// Lower shard.all_slice into tensor.extract_slice.
 ///
 /// The slice offset is derived from the linear process id:
@@ -197,9 +245,9 @@ struct LowerProcessLinearIndex final : public RewritePattern {
 ///
 /// Restrictions (current implementation):
 ///   - ranked 1-D tensors only
-///   - static slice size only
-///   - slicing is along dim 0 and the offset is derived from linearIdx
-///   - no bounds/padding handling (assumes exact partitioning)
+///   - Supports exact and non-exact 1-D block partitioning.
+///   - slicing is along dim 0 with offset/size computed from the linear Process
+///   Id
 struct LowerAllSlice final : public RewritePattern {
   explicit LowerAllSlice(MLIRContext *ctx)
       : RewritePattern("shard.all_slice", /*benefit=*/1, ctx) {}
@@ -218,9 +266,8 @@ struct LowerAllSlice final : public RewritePattern {
     if (resultTy.getRank() != 1 || inputTy.getRank() != 1)
       return failure();
 
-    // Only static size.
-    int64_t sliceSize = resultTy.getShape()[0];
-    if (sliceSize <= 0)
+    int64_t globalDim = inputTy.getShape()[0];
+    if (globalDim <= 0)
       return failure();
 
     auto func = op->getParentOfType<func::FuncOp>();
@@ -235,14 +282,30 @@ struct LowerAllSlice final : public RewritePattern {
 
     Value linearIdx = *linearIdxOrFail;
 
-    // offset = linearIdx * sliceSize
-    Value sliceSizeVal =
-        rewriter.create<arith::ConstantIndexOp>(loc, sliceSize);
-    Value offset = rewriter.create<arith::MulIOp>(loc, linearIdx, sliceSizeVal);
+    auto numShardsOrFail = resolveNumShardsFromModule(op);
+    if (failed(numShardsOrFail))
+      return failure();
 
-    // tensor.extract_slice %in[%offset] [%sliceSize] [1]
+    int64_t numShards = *numShardsOrFail;
+    bool isExact = (globalDim % numShards) == 0;
+    if (!isExact && !resultTy.isDynamicDim(0))
+      return failure();
+
+    auto sliceInfoOrFail =
+        computeLocal1DSliceInfo(loc, linearIdx, globalDim, numShards, rewriter);
+    if (failed(sliceInfoOrFail))
+      return failure();
+
+    Value offset = sliceInfoOrFail->offset;
+    Value dynSize = sliceInfoOrFail->size;
+
+    // tensor.extract_slice %in[%offset] [%size] [1]
     SmallVector<OpFoldResult> offsets{offset};
-    SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(sliceSize)};
+    SmallVector<OpFoldResult> sizes;
+    if (resultTy.isDynamicDim(0))
+      sizes.push_back(dynSize);
+    else
+      sizes.push_back(rewriter.getIndexAttr(resultTy.getShape()[0]));
     SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1)};
 
     Value input = op->getOperand(0);

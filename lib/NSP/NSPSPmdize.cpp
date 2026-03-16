@@ -465,19 +465,65 @@ struct NSPSpmdizePass
                                   /*isSigned=*/true);
 
     // Helper to compute a "local" tensor type for split along axis 0.
+    //
+    // For exact divisions we keep a static local type.
+    // For non-exact divisions we use a dynamic leading dimension and compute
+    // the actual local size at runtime from the linear process id.
     auto getLocalType = [&](RankedTensorType globalTy) -> RankedTensorType {
       if (!globalTy || globalTy.getRank() == 0)
         return RankedTensorType();
       int64_t dim0 = globalTy.getDimSize(0);
       if (ShapedType::isDynamic(dim0))
         return RankedTensorType();
-      if (dim0 % numShards != 0)
-        return RankedTensorType();
       SmallVector<int64_t> newShape(globalTy.getShape().begin(),
                                     globalTy.getShape().end());
-      newShape[0] = dim0 / numShards;
+      if (dim0 % numShards == 0)
+        newShape[0] = dim0 / numShards;
+      else
+        newShape[0] = ShapedType::kDynamic;
       return RankedTensorType::get(newShape, globalTy.getElementType(),
                                    globalTy.getEncoding());
+    };
+
+    // Build the local shard [offset, size] for a 1-D block partition:
+    //   base = N / P
+    //   rem  = N % P
+    //   size(pid)   = base + (pid < rem ? 1 : 0)
+    //   offset(pid) = pid * base + min(pid, rem)
+    auto buildLocalShardOffsetAndSize =
+        [&](OpBuilder &b, Location loc, Value procIdx,
+            int64_t globalDim) -> std::pair<Value, Value> {
+      Value cBase =
+          b.create<arith::ConstantIndexOp>(loc, globalDim / numShards);
+      Value cRem = b.create<arith::ConstantIndexOp>(loc, globalDim % numShards);
+      Value cZero = b.create<arith::ConstantIndexOp>(loc, 0);
+      Value cOne = b.create<arith::ConstantIndexOp>(loc, 1);
+
+      Value isRemainderShard = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ult, procIdx, cRem);
+      Value extra =
+          b.create<arith::SelectOp>(loc, isRemainderShard, cOne, cZero);
+      Value localSize = b.create<arith::AddIOp>(loc, cBase, extra);
+
+      Value minPidRem =
+          b.create<arith::SelectOp>(loc, isRemainderShard, procIdx, cRem);
+      Value scaledPid = b.create<arith::MulIOp>(loc, procIdx, cBase);
+      Value offset = b.create<arith::AddIOp>(loc, scaledPid, minPidRem);
+      return {offset, localSize};
+    };
+
+    auto createLocalEmpty = [&](OpBuilder &b, Location loc,
+                                RankedTensorType localTy,
+                                Value dynamicDim0) -> Value {
+      if (!localTy || localTy.getRank() != 1)
+        return Value();
+      if (localTy.isDynamicDim(0)) {
+        return b.create<tensor::EmptyOp>(loc, localTy.getShape(),
+                                         localTy.getElementType(),
+                                         ValueRange{dynamicDim0});
+      }
+      return b.create<tensor::EmptyOp>(loc, localTy.getShape(),
+                                       localTy.getElementType(), ValueRange{});
     };
 
     module.walk([&](mlir::func::FuncOp func) {
@@ -592,6 +638,8 @@ struct NSPSpmdizePass
               prod.getDpsInputOperand(i)->get().getType());
           if (!inTy || inTy.getRank() != 1)
             return false;
+          if (inTy.getDimSize(0) != resTy.getDimSize(0))
+            return false;
           if (getLocalType(inTy) != expectedLocalTy)
             return false;
         }
@@ -601,10 +649,10 @@ struct NSPSpmdizePass
       // Build a local-tile version of a global value by cloning a chain of
       // compatible elementwise producers. This avoids materializing full global
       // intermediates when only the final store is tiled.
-      std::function<Value(Value, RankedTensorType,
+      std::function<Value(Value, RankedTensorType, Value,
                           llvm::DenseMap<Value, Value> &)>
           materializeLocalValue =
-              [&](Value v, RankedTensorType expectedLocalTy,
+              [&](Value v, RankedTensorType expectedLocalTy, Value localDim0,
                   llvm::DenseMap<Value, Value> &cache) -> Value {
         Value base = stripTrivialWrappers(v);
         auto it = cache.find(base);
@@ -614,9 +662,10 @@ struct NSPSpmdizePass
         // linalg.fill: produce a local constant tile.
         if (auto fill =
                 dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
-          Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              fill.getLoc(), expectedLocalTy.getShape(),
-              expectedLocalTy.getElementType());
+          Value outLocalInit =
+              createLocalEmpty(b, fill.getLoc(), expectedLocalTy, localDim0);
+          if (!outLocalInit)
+            return Value();
           auto localFill = b.create<mlir::linalg::FillOp>(
               fill.getLoc(), /*inputs=*/fill.getInputs(),
               /*outputs=*/ValueRange{outLocalInit});
@@ -634,13 +683,14 @@ struct NSPSpmdizePass
             prodInputs.reserve(nIn);
             for (int64_t i = 0; i < nIn; ++i) {
               Value inV = prod.getDpsInputOperand(i)->get();
-              prodInputs.push_back(
-                  materializeLocalValue(inV, expectedLocalTy, cache));
+              prodInputs.push_back(materializeLocalValue(inV, expectedLocalTy,
+                                                         localDim0, cache));
             }
 
-            Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-                prod.getLoc(), expectedLocalTy.getShape(),
-                expectedLocalTy.getElementType());
+            Value outLocalInit =
+                createLocalEmpty(b, prod.getLoc(), expectedLocalTy, localDim0);
+            if (!outLocalInit)
+              return Value();
 
             auto newProd = b.create<mlir::linalg::GenericOp>(
                 prod.getLoc(),
@@ -750,13 +800,20 @@ struct NSPSpmdizePass
           g.emitError() << "NSPSpmdize: cannot compute local tile type for "
                            "result "
                         << outResTy << " with grid size " << numShards
-                        << " (requires static dim0 divisible by grid size)";
+                        << " (requires static dim0)";
           signalPassFailure();
           return;
         }
 
-        // Inputs must be consistently splittable.
+        // Inputs must be consistently splittable and have the same leading
+        // dimension as the result.
         for (RankedTensorType t : inputTys) {
+          if (t.getDimSize(0) != outResTy.getDimSize(0)) {
+            g.emitError() << "NSPSpmdize: unsupported elementwise generic; "
+                             "input/result dim0 mismatch";
+            signalPassFailure();
+            return;
+          }
           if (getLocalType(t) != localTy) {
             g.emitError()
                 << "NSPSpmdize: unsupported elementwise generic; input "
@@ -768,6 +825,14 @@ struct NSPSpmdizePass
 
         Location loc = g.getLoc();
         b.setInsertionPoint(g);
+
+        // Keep non-uniform tiles out of the collective path for now.
+        if (allowCollectives && localTy.isDynamicDim(0)) {
+          g.emitError() << "NSPSpmdize: non-uniform shard sizes are not yet "
+                           "supported with collectives/all_gather";
+          signalPassFailure();
+          return;
+        }
 
         // Non-collective path must ONLY rewrite ops that directly materialize
         // into a destination memref. Intermediate elementwise ops (common in
@@ -785,6 +850,10 @@ struct NSPSpmdizePass
           }
         }
 
+        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        auto [localOffset, localDim0] = buildLocalShardOffsetAndSize(
+            b, loc, procIdx, outResTy.getDimSize(0));
+
         // Slice inputs into per-core tiles.
         //
         // For chained elementwise patterns, attempt to clone compatible
@@ -794,14 +863,19 @@ struct NSPSpmdizePass
         SmallVector<Value> localInputs;
         localInputs.reserve(numInputs);
         for (Value in : inputs)
-          localInputs.push_back(materializeLocalValue(in, localTy, localCache));
+          localInputs.push_back(
+              materializeLocalValue(in, localTy, localDim0, localCache));
 
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
         auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
         if (!oldInitTy || oldInitTy != localTy) {
-          outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              loc, localTy.getShape(), localTy.getElementType());
+          outLocalInit = createLocalEmpty(b, loc, localTy, localDim0);
+          if (!outLocalInit) {
+            g.emitError() << "NSPSpmdize: failed to create local output tensor";
+            signalPassFailure();
+            return;
+          }
         }
 
         // Clone the generic op with local operands.
@@ -856,10 +930,8 @@ struct NSPSpmdizePass
         }
 
         auto localResTy = dyn_cast<RankedTensorType>(localResult.getType());
-        int64_t tileSize = localResTy.getDimSize(0);
-        if (ShapedType::isDynamic(tileSize)) {
-          mat.emitError()
-              << "NSPSpmdize: store-by-tile requires a static tile size";
+        if (!localResTy || localResTy.getRank() != 1) {
+          mat.emitError() << "NSPSpmdize: expected ranked 1D local result";
           signalPassFailure();
           return;
         }
@@ -868,24 +940,29 @@ struct NSPSpmdizePass
         b.setInsertionPoint(mat);
 
         // procIdx is an index in [0, numShards).
-        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        Value storeProcIdx =
+            b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        auto [offset, dynTileSize] = buildLocalShardOffsetAndSize(
+            b, loc, storeProcIdx, outResTy.getDimSize(0));
 
-        // offset = procIdx * tileSize
-        Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
-        Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
+        int64_t staticTileSize = localResTy.isDynamicDim(0)
+                                     ? ShapedType::kDynamic
+                                     : localResTy.getDimSize(0);
 
-        SmallVector<OpFoldResult> offsets = {offset}; // dynamic offset
-        SmallVector<OpFoldResult> sizes = {
-            b.getIndexAttr(tileSize)}; // static size
-        SmallVector<OpFoldResult> strides = {
-            b.getIndexAttr(1)}; // static stride
+        SmallVector<OpFoldResult> offsets = {offset};
+        SmallVector<OpFoldResult> sizes;
+        if (staticTileSize == ShapedType::kDynamic)
+          sizes.push_back(dynTileSize);
+        else
+          sizes.push_back(b.getIndexAttr(staticTileSize));
+        SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};
 
         // Create a subview into the destination buffer corresponding to this
         // process' tile.
         auto subLayout = StridedLayoutAttr::get(
             destTy.getContext(), /*offset=*/ShapedType::kDynamic,
             /*strides=*/ArrayRef<int64_t>{1});
-        auto subTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
+        auto subTy = MemRefType::get(ArrayRef<int64_t>{staticTileSize},
                                      destTy.getElementType(), subLayout,
                                      destTy.getMemorySpace());
 
