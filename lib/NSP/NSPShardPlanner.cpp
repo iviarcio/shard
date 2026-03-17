@@ -42,7 +42,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -139,7 +139,7 @@ struct NSPShardPlannerPass
     ModuleOp module = func->getParentOfType<ModuleOp>();
     shard::GridOp grid = getOrCreateGrid(module, policy.nspCount);
 
-    DenseMap<std::string, Value> shardingCache;
+    llvm::StringMap<Value> shardingCache;
 
     // We rebuild (and erase) linalg.generic ops during annotation.
     // Erasing ops while walking can invalidate the walk. We collect
@@ -224,11 +224,10 @@ private:
 
   /// Return an existing !shard.sharding value for the same grid/split_axes,
   /// or create and cache a new one if it does not exist yet.
-  static Value
-  getOrCreateShardingValue(OpBuilder &b, Location loc, shard::GridOp grid,
-                           ArrayRef<shard::GridAxesAttr> splitAxes,
-                           DenseMap<std::string, Value> &shardingCache) {
-
+  static Value getOrCreateShardingValue(OpBuilder &b, Location loc,
+                                        shard::GridOp grid,
+                                        ArrayRef<shard::GridAxesAttr> splitAxes,
+                                        llvm::StringMap<Value> &shardingCache) {
     std::string key = buildShardingCacheKey(grid, splitAxes);
 
     if (auto it = shardingCache.find(key); it != shardingCache.end())
@@ -589,7 +588,7 @@ private:
   static linalg::GenericOp
   annotateGenericWithShard(linalg::GenericOp op, shard::GridOp grid,
                            const ShardPlan &plan,
-                           DenseMap<std::string, Value> &shardingCache) {
+                           llvm::StringMap<Value> &shardingCache) {
 
     // ------------------------------------------------------------------
     // Obs. on Shard dialect (based on ODS from LLVM commit: 064f02dac):
