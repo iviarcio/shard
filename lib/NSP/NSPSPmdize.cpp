@@ -34,6 +34,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <functional>
 #include <iterator>
@@ -480,6 +481,26 @@ struct NSPSpmdizePass
                                    globalTy.getEncoding());
     };
 
+    // Return the shard-local shape obtained by splitting along axis 0.
+    // This intentionally ignores element type and encoding so that
+    // type-changing elementwise ops (e.g. f16 -> f32) can still be
+    // recognized as shard-compatible.
+    auto getLocalShape =
+        [&](RankedTensorType globalTy) -> std::optional<SmallVector<int64_t>> {
+      auto localTy = getLocalType(globalTy);
+      if (!localTy)
+        return std::nullopt;
+      return SmallVector<int64_t>(localTy.getShape().begin(),
+                                  localTy.getShape().end());
+    };
+
+    auto haveSameLocalShape = [&](RankedTensorType a,
+                                  RankedTensorType b) -> bool {
+      auto aShape = getLocalShape(a);
+      auto bShape = getLocalShape(b);
+      return aShape && bShape && (*aShape == *bShape);
+    };
+
     module.walk([&](mlir::func::FuncOp func) {
       OpBuilder b(func.getContext());
 
@@ -584,7 +605,7 @@ struct NSPSpmdizePass
           return false;
 
         auto prodLocalTy = getLocalType(resTy);
-        if (!prodLocalTy || prodLocalTy != expectedLocalTy)
+        if (!prodLocalTy || !haveSameLocalShape(resTy, expectedLocalTy))
           return false;
 
         for (int64_t i = 0; i < nIn; ++i) {
@@ -592,7 +613,7 @@ struct NSPSpmdizePass
               prod.getDpsInputOperand(i)->get().getType());
           if (!inTy || inTy.getRank() != 1)
             return false;
-          if (getLocalType(inTy) != expectedLocalTy)
+          if (!haveSameLocalShape(inTy, expectedLocalTy))
             return false;
         }
         return true;
@@ -755,15 +776,23 @@ struct NSPSpmdizePass
           return;
         }
 
-        // Inputs must be consistently splittable.
+        // Inputs must shard to the same local shape as the result.
+        // Do not require full local type equality here: elementwise ops may
+        // legitimately change element type (e.g. f16 -> f32) while still
+        // being perfectly shard-compatible.
+        bool compatibleLocalShapes = true;
         for (RankedTensorType t : inputTys) {
-          if (getLocalType(t) != localTy) {
-            g.emitError()
-                << "NSPSpmdize: unsupported elementwise generic; input "
-                   "types are not consistently splittable along axis 0";
-            signalPassFailure();
-            return;
+          if (!haveSameLocalShape(t, outResTy)) {
+            compatibleLocalShapes = false;
+            break;
           }
+        }
+        if (!compatibleLocalShapes) {
+          // Leave this op untouched and continue. Failing the whole pass here
+          // keeps shard annotations alive and breaks later passes, while this
+          // specific generic is simply not supported by the current bring-up
+          // materialization.
+          continue;
         }
 
         Location loc = g.getLoc();
