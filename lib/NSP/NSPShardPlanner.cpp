@@ -249,6 +249,7 @@ private:
 
   /// Look for an existing shard.shard that already annotates `src` with
   /// the given sharding value, and return its result if found.
+  /// Obs.: The reuse is valid only for inputs.
   static Value getExistingShardFor(Value src, Value sharding) {
     for (Operation *user : src.getUsers()) {
       auto shardOp = dyn_cast<shard::ShardOp>(user);
@@ -261,7 +262,7 @@ private:
   }
 
   /// Reuse an existing shard.shard for (`src`, `sharding`) when available;
-  /// otherwise create a new shard annotation op.
+  /// otherwise create a new shard annotation op. obs.: input only
   static Value getOrCreateShardFor(OpBuilder &b, Location loc, MLIRContext *ctx,
                                    Value src, Value sharding) {
 
@@ -299,6 +300,60 @@ private:
     return buildShardingValueFor(map, value);
   }
 
+  /// If `value` is produced by linalg.transpose, map a source tensor dimension
+  /// `srcDim` to the corresponding result dimension. Return std::nullopt if
+  /// the mapping cannot be derived.
+  static std::optional<int64_t>
+  mapTransposeSourceDimToResultDim(Value value, int64_t srcDim) {
+    auto transposeOp = value.getDefiningOp<linalg::TransposeOp>();
+    if (!transposeOp)
+      return std::nullopt;
+
+    auto permutation = transposeOp.getPermutation();
+    for (auto it : llvm::enumerate(permutation)) {
+      if (it.value() == srcDim)
+        return static_cast<int64_t>(it.index());
+    }
+    return std::nullopt;
+  }
+
+  /// Try to choose a shard iterator that is consistent with a transpose input.
+  /// Heuristic:
+  ///   - If the generic has a transpose input
+  ///   - and the output map is an identity/projected permutation
+  ///   - then preserve the canonical "source dim 0" sharding through the
+  ///     transpose permutation.
+  /// This is especially useful for softmax-like patterns where a tensor is
+  /// transposed before a pointwise op and later reduced.
+  static std::optional<int64_t>
+  pickShardIteratorFromTransposeInput(linalg::GenericOp op) {
+    auto maps = op.getIndexingMapsArray();
+    linalg::LinalgOp linalgOp(op);
+
+    if (linalgOp.getNumDpsInits() != 1)
+      return std::nullopt;
+
+    AffineMap outMap = maps[linalgOp.getNumDpsInputs()];
+    if (!outMap.isProjectedPermutation())
+      return std::nullopt;
+
+    for (unsigned i = 0; i < linalgOp.getNumDpsInputs(); ++i) {
+      Value in = op.getInputs()[i];
+      auto maybeResultDim = mapTransposeSourceDimToResultDim(in, /*srcDim=*/0);
+      if (!maybeResultDim)
+        continue;
+
+      int64_t resultDim = *maybeResultDim;
+      if (resultDim < 0 || resultDim >= static_cast<int64_t>(outMap.getNumResults()))
+        continue;
+
+      if (auto dimExpr = dyn_cast<AffineDimExpr>(outMap.getResult(resultDim)))
+        return static_cast<int64_t>(dimExpr.getPosition());
+    }
+
+    return std::nullopt;
+  }
+
   /// Build a sharding plan for a linalg.generic op.
   ///
   /// The key inputs are:
@@ -328,7 +383,10 @@ private:
     AffineMap outMap = op.getIndexingMapsArray().back();
 
     // Pick a sharding iterator.
-    plan.shardIter = pickShardIteratorIndex(outMap, iters, policy);
+    if (auto transposeChoice = pickShardIteratorFromTransposeInput(op))
+      plan.shardIter = *transposeChoice;
+    else
+      plan.shardIter = pickShardIteratorIndex(outMap, iters, policy);
     if (plan.shardIter < 0)
       return failure();
 
