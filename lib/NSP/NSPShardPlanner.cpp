@@ -39,11 +39,12 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
-
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
@@ -138,6 +139,8 @@ struct NSPShardPlannerPass
     ModuleOp module = func->getParentOfType<ModuleOp>();
     shard::GridOp grid = getOrCreateGrid(module, policy.nspCount);
 
+    DenseMap<std::string, Value> shardingCache;
+
     // We rebuild (and erase) linalg.generic ops during annotation.
     // Erasing ops while walking can invalidate the walk. We collect
     // first, then rewrite in a stable loop.
@@ -166,8 +169,8 @@ struct NSPShardPlannerPass
 
       // Attach shard annotations to operands using shard.shard AND rebuild
       // the linalg.generic so that it consumes the annotated values.
-      linalg::GenericOp newOp = annotateGenericWithShard(op, grid, *plan);
-
+      linalg::GenericOp newOp =
+          annotateGenericWithShard(op, grid, *plan, shardingCache);
       // If needed, insert shard collectives (e.g. all-reduce) explicitly.
       // In many pipelines, a later pass does this; but we show it here
       // to make the semantics explicit.
@@ -192,6 +195,87 @@ private:
     SmallVector<int64_t, 1> shape = {nspCount};
     return b.create<shard::GridOp>(module.getLoc(), "nsp",
                                    llvm::ArrayRef<int64_t>(shape));
+  }
+
+  /// Build a stable cache key for a sharding configuration.
+  /// The key is derived from the grid symbol and per-dimension split axes.
+  static std::string
+  buildShardingCacheKey(shard::GridOp grid,
+                        ArrayRef<shard::GridAxesAttr> splitAxes) {
+    std::string key;
+    llvm::raw_string_ostream os(key);
+
+    os << grid.getSymName();
+    os << '|';
+
+    for (shard::GridAxesAttr axes : splitAxes) {
+      os << '[';
+      auto ref = axes.asArrayRef();
+      for (size_t i = 0; i < ref.size(); ++i) {
+        if (i)
+          os << ',';
+        os << ref[i];
+      }
+      os << ']';
+    }
+
+    return os.str();
+  }
+
+  /// Return an existing !shard.sharding value for the same grid/split_axes,
+  /// or create and cache a new one if it does not exist yet.
+  static Value
+  getOrCreateShardingValue(OpBuilder &b, Location loc, shard::GridOp grid,
+                           ArrayRef<shard::GridAxesAttr> splitAxes,
+                           DenseMap<std::string, Value> &shardingCache) {
+
+    std::string key = buildShardingCacheKey(grid, splitAxes);
+
+    if (auto it = shardingCache.find(key); it != shardingCache.end())
+      return it->second;
+
+    auto gridRef = FlatSymbolRefAttr::get(grid.getSymNameAttr());
+
+    auto shardingOp = b.create<shard::ShardingOp>(
+        loc,
+        /*grid=*/gridRef,
+        /*split_axes=*/splitAxes,
+        /*static_halo_sizes=*/ArrayRef<int64_t>{},
+        /*static_sharded_dims_offsets=*/ArrayRef<int64_t>{});
+
+    Value result = shardingOp.getResult();
+    shardingCache.try_emplace(key, result);
+    return result;
+  }
+
+  /// Look for an existing shard.shard that already annotates `src` with
+  /// the given sharding value, and return its result if found.
+  static Value getExistingShardFor(Value src, Value sharding) {
+    for (Operation *user : src.getUsers()) {
+      auto shardOp = dyn_cast<shard::ShardOp>(user);
+      if (!shardOp)
+        continue;
+      if (shardOp.getSrc() == src && shardOp.getSharding() == sharding)
+        return shardOp.getResult();
+    }
+    return Value();
+  }
+
+  /// Reuse an existing shard.shard for (`src`, `sharding`) when available;
+  /// otherwise create a new shard annotation op.
+  static Value getOrCreateShardFor(OpBuilder &b, Location loc, MLIRContext *ctx,
+                                   Value src, Value sharding) {
+
+    if (Value existing = getExistingShardFor(src, sharding))
+      return existing;
+
+    auto shardOp =
+        b.create<shard::ShardOp>(loc, src.getType(),
+                                 /*src=*/src,
+                                 /*sharding=*/sharding,
+                                 /*annotate_for_users=*/UnitAttr::get(ctx));
+
+    return shardOp.getResult();
   }
 
   /// Build a sharding plan for a linalg.generic op.
@@ -502,9 +586,10 @@ private:
   /// the sharded operands; the region body is moved without cloning.
   ///
   /// \returns The newly created linalg::GenericOp consuming sharded operands.
-  static linalg::GenericOp annotateGenericWithShard(linalg::GenericOp op,
-                                                    shard::GridOp grid,
-                                                    const ShardPlan &plan) {
+  static linalg::GenericOp
+  annotateGenericWithShard(linalg::GenericOp op, shard::GridOp grid,
+                           const ShardPlan &plan,
+                           DenseMap<std::string, Value> &shardingCache) {
 
     // ------------------------------------------------------------------
     // Obs. on Shard dialect (based on ODS from LLVM commit: 064f02dac):
@@ -600,19 +685,8 @@ private:
       SmallVector<shard::GridAxesAttr> splitAxes =
           buildSplitAxesForOperand(map, rtt);
 
-      // shard.sharding takes a symbol ref to the grid (e.g. @nsp).
-      auto gridRef = FlatSymbolRefAttr::get(grid.getSymNameAttr());
-
       // Create the sharding descriptor value.
-      // NOTE: halo sizes / offsets are kept empty for now.
-      auto shardingOp = b.create<shard::ShardingOp>(
-          loc,
-          /*grid=*/gridRef,
-          /*split_axes=*/llvm::ArrayRef<shard::GridAxesAttr>(splitAxes),
-          /*static_halo_sizes=*/llvm::ArrayRef<int64_t>{},
-          /*static_sharded_dims_offsets=*/llvm::ArrayRef<int64_t>{});
-
-      return shardingOp.getResult(); // !shard.sharding
+      return getOrCreateShardingValue(b, loc, grid, splitAxes, shardingCache);
     };
 
     // -------------------------------------------------------------------
@@ -637,12 +711,7 @@ private:
         newInputs.push_back(in);
         continue;
       }
-      auto shardOp =
-          b.create<shard::ShardOp>(loc, in.getType(),
-                                   /*src=*/in,
-                                   /*sharding=*/shardingVal,
-                                   /*annotate_for_users=*/UnitAttr::get(ctx));
-      newInputs.push_back(shardOp.getResult());
+      newInputs.push_back(getOrCreateShardFor(b, loc, ctx, in, shardingVal));
     }
 
     // Wrap each tensor output (init tensor) with shard.shard.
@@ -704,12 +773,7 @@ private:
         newOutputs.push_back(out);
         continue;
       }
-      auto shardOp =
-          b.create<shard::ShardOp>(loc, out.getType(),
-                                   /*src=*/out,
-                                   /*sharding=*/shardingVal,
-                                   /*annotate_for_users=*/UnitAttr::get(ctx));
-      newOutputs.push_back(shardOp.getResult());
+      newOutputs.push_back(getOrCreateShardFor(b, loc, ctx, out, shardingVal));
     }
 
     // Rebuild the linalg::GenericOp so that it consumes the sharded SSA values.
