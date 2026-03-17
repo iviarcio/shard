@@ -277,6 +277,28 @@ private:
     return shardOp.getResult();
   }
 
+  /// Prefer an existing sharding attached to `value`; otherwise build a new
+  /// sharding descriptor from the current operand indexing map.
+  static Value getOrInferInputSharding(
+      OpBuilder &b, Location loc, Value value, AffineMap map,
+      function_ref<Value(AffineMap, Value)> buildShardingValueFor) {
+    // Fast path: the value is directly produced by shard.shard.
+    if (auto shardOp = value.getDefiningOp<shard::ShardOp>())
+      return shardOp.getSharding();
+
+    // Fallback: If the value already participates in a shard
+    // annotation, reuse that sharding instead of recomputing locally.
+    for (Operation *user : value.getUsers()) {
+      if (auto shardOp = dyn_cast<shard::ShardOp>(user)) {
+        if (shardOp.getSrc() == value)
+          return shardOp.getSharding();
+      }
+    }
+
+    // Otherwise, infer sharding from the local consumer map.
+    return buildShardingValueFor(map, value);
+  }
+
   /// Build a sharding plan for a linalg.generic op.
   ///
   /// The key inputs are:
@@ -705,7 +727,8 @@ private:
     for (unsigned i = 0; i < linalgOp.getNumDpsInputs(); ++i) {
       Value in = op.getInputs()[i];
       AffineMap map = maps[i];
-      Value shardingVal = buildShardingValueFor(map, in);
+      Value shardingVal =
+          getOrInferInputSharding(b, loc, in, map, buildShardingValueFor);
       if (!shardingVal) {
         newInputs.push_back(in);
         continue;
