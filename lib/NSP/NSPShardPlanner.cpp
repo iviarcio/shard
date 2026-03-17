@@ -772,7 +772,13 @@ private:
         newOutputs.push_back(out);
         continue;
       }
-      newOutputs.push_back(getOrCreateShardFor(b, loc, ctx, out, shardingVal));
+      auto shardOp = b.create<shard::ShardOp>(
+          loc,
+          out.getType(),
+          /*src=*/out,
+          /*sharding=*/shardingVal,
+          /*annotate_for_users=*/UnitAttr::get(ctx));
+      newOutputs.push_back(shardOp.getResult());
     }
 
     // Rebuild the linalg::GenericOp so that it consumes the sharded SSA values.
