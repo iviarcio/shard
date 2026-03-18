@@ -31,10 +31,10 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 
 #include <functional>
 #include <iterator>
@@ -582,6 +582,13 @@ struct NSPSpmdizePass
       auto isCompatibleElementwiseGeneric =
           [&](mlir::linalg::GenericOp prod,
               RankedTensorType expectedLocalTy) -> bool {
+        auto expectedShape = getLocalShape(expectedLocalTy);
+        if (!expectedShape) {
+          // expectedLocalTy is already supposed to be shard-local.
+          // If we cannot reason about its shape, do not clone recursively.
+          return false;
+        }
+
         const int64_t nIn = prod.getNumDpsInputs();
         if ((nIn != 1 && nIn != 2) || prod.getNumDpsInits() != 1)
           return false;
@@ -605,7 +612,11 @@ struct NSPSpmdizePass
           return false;
 
         auto prodLocalTy = getLocalType(resTy);
-        if (!prodLocalTy || !haveSameLocalShape(resTy, expectedLocalTy))
+        if (!prodLocalTy)
+          return false;
+        // expectedLocalTy is already local. Do NOT pass it to
+        // haveSameLocalShape(), which expects global types
+        if (prodLocalTy.getShape() != expectedLocalTy.getShape())
           return false;
 
         for (int64_t i = 0; i < nIn; ++i) {
@@ -613,7 +624,10 @@ struct NSPSpmdizePass
               prod.getDpsInputOperand(i)->get().getType());
           if (!inTy || inTy.getRank() != 1)
             return false;
-          if (!haveSameLocalShape(inTy, expectedLocalTy))
+          auto inLocalTy = getLocalType(inTy);
+          if (!inLocalTy)
+            return false;
+          if (inLocalTy.getShape() != expectedLocalTy.getShape())
             return false;
         }
         return true;
@@ -714,6 +728,7 @@ struct NSPSpmdizePass
       func.walk([&](mlir::linalg::GenericOp g) { worklist.push_back(g); });
 
       for (mlir::linalg::GenericOp g : worklist) {
+
         // Pattern: elementwise 1D generic with identity maps.
         const int64_t numInputs = g.getNumDpsInputs();
         if ((numInputs != 1 && numInputs != 2) || g.getNumDpsInits() != 1)
@@ -797,6 +812,21 @@ struct NSPSpmdizePass
 
         Location loc = g.getLoc();
         b.setInsertionPoint(g);
+
+        // If this generic is already inside a loop explicitly distributed by
+        // this pass, do not apply the non-collective "store-by-tile"
+        // materialization path again.
+        //
+        // Rationale:
+        //   In distributed DOALL patterns (e.g. softmax outer-loop
+        //   distribution), the partitioning semantics are already carried by
+        //   the surrounding scf.for schedule:
+        //     lb'   = lb + procIdx * step
+        //     step' = step * numShards
+        if (!allowCollectives)
+          if (auto parentFor = g->getParentOfType<mlir::scf::ForOp>())
+            if (parentFor->hasAttr("nsp.distributed"))
+              continue;
 
         // Non-collective path must ONLY rewrite ops that directly materialize
         // into a destination memref. Intermediate elementwise ops (common in
