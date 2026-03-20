@@ -318,6 +318,77 @@ struct NSPSpmdizePass
         return foundIvIndexedStore;
       };
 
+      // Try to materialize a shard-local memref tile directly from a
+      // tensor value. when the tensor is a trivial wrapper around
+      // bufferization.to_tensor(memref).
+      //
+      // Supported pattern:
+      //   %t0 = bufferization.to_tensor %m : memref<NxT> -> tensor<NxT>
+      //   %t1 = tensor.cast %t0 : ...
+      //   %t2 = shard.shard %t1 to %sharding
+      //
+      // Result:
+      //   memref.subview %m[offset][tileSize][1]
+      //
+      // This helper is used by the direct store-by-tile fast path. When it
+      // fails, callers must fall back to the tensor-local path.
+      auto tryBuildDirectInputSubview = [&](Value tensorV, Location loc,
+                                            Value offset,
+                                            int64_t tileSize) -> Value {
+        Value base = stripTrivialWrappers(tensorV);
+
+        auto toTensor =
+            dyn_cast_or_null<bufferization::ToTensorOp>(base.getDefiningOp());
+        if (!toTensor)
+          return Value();
+
+        Value memrefIn = toTensor.getMemref();
+        auto memrefTy = dyn_cast<MemRefType>(memrefIn.getType());
+        if (!memrefTy || memrefTy.getRank() != 1)
+          return Value();
+
+        if (ShapedType::isDynamic(memrefTy.getDimSize(0)))
+          return Value();
+
+        SmallVector<OpFoldResult> offsets = {offset};
+        SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};
+        SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};
+
+        auto subLayout = StridedLayoutAttr::get(
+            memrefTy.getContext(), /*offset=*/ShapedType::kDynamic,
+            /*strides=*/ArrayRef<int64_t>{1});
+        auto subTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
+                                     memrefTy.getElementType(), subLayout,
+                                     memrefTy.getMemorySpace());
+
+        return b.create<memref::SubViewOp>(loc, subTy, memrefIn, offsets, sizes,
+                                           strides);
+      };
+
+      // Clone the body of a linalg.generic into another linalg.generic.
+      // This is used by the direct buffer path because we cannot takeBody()
+      // speculatively before knowing whether the fast path will succeed.
+      auto cloneGenericRegion = [&](mlir::linalg::GenericOp src,
+                                    mlir::linalg::GenericOp dst) {
+        dst.getRegion().getBlocks().clear();
+
+        Block &srcBlock = src.getRegion().front();
+        Block *dstBlock = new Block();
+        dst.getRegion().push_back(dstBlock);
+
+        for (BlockArgument a : srcBlock.getArguments())
+          dstBlock->addArgument(a.getType(), a.getLoc());
+
+        IRMapping map;
+        for (auto [sa, da] :
+             llvm::zip(srcBlock.getArguments(), dstBlock->getArguments()))
+          map.map(sa, da);
+
+        OpBuilder nb = OpBuilder::atBlockEnd(dstBlock);
+        for (Operation &op : srcBlock.getOperations())
+          nb.clone(op, map);
+      };
+
       for (mlir::scf::ForOp forOp : loops) {
         // Bring-up constraints:
         //  - no iter_args / no results
@@ -844,6 +915,99 @@ struct NSPSpmdizePass
           }
         }
 
+        // Try a direct buffer fast path in non-collective mode:
+        //   * inputs are sliced as memref.subview directly from their backing
+        //     memrefs (only if they come from bufferization.to_tensor)
+        //   * output is written directly into a memref.subview of the final
+        //     destination
+        //
+        // This avoids creating a temporary local tensor for the output tile,
+        // which otherwise tends to survive bufferization/CSE as a malloc.
+        //
+        // If any precondition is not met, fall back to the existing tensor path
+        // below. This keeps producer-cloning cases (e.g. chained gelu) working.
+        if (!allowCollectives) {
+          auto mat = sink->first;
+          auto &wrappers = sink->second;
+
+          Value dest = mat->getOperand(1);
+          auto destTy = dyn_cast<MemRefType>(dest.getType());
+          if (destTy && destTy.getRank() == 1 &&
+              !ShapedType::isDynamic(localTy.getDimSize(0))) {
+            int64_t tileSize = localTy.getDimSize(0);
+
+            b.setInsertionPoint(mat);
+
+            Value procIdx =
+                b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+            Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
+            Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
+
+            SmallVector<OpFoldResult> offsets = {offset};
+            SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};
+            SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};
+
+            auto subLayout = StridedLayoutAttr::get(
+                destTy.getContext(), /*offset=*/ShapedType::kDynamic,
+                /*strides=*/ArrayRef<int64_t>{1});
+            auto outSubTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
+                                            destTy.getElementType(), subLayout,
+                                            destTy.getMemorySpace());
+
+            Value destSubview = b.create<memref::SubViewOp>(
+                loc, outSubTy, dest, offsets, sizes, strides);
+
+            SmallVector<Value> inputSubviews;
+            inputSubviews.reserve(numInputs);
+
+            bool canUseDirectBufferPath = true;
+            for (Value in : inputs) {
+              Value inSubview =
+                  tryBuildDirectInputSubview(in, loc, offset, tileSize);
+              if (!inSubview) {
+                canUseDirectBufferPath = false;
+                break;
+              }
+
+              auto inSubviewTy = dyn_cast<MemRefType>(inSubview.getType());
+              if (!inSubviewTy ||
+                  inSubviewTy.getElementType() !=
+                      cast<ShapedType>(in.getType()).getElementType()) {
+                canUseDirectBufferPath = false;
+                break;
+              }
+              inputSubviews.push_back(inSubview);
+            }
+
+            // Also require destination element type to match the generic
+            // result.
+            if (destTy.getElementType() != outResTy.getElementType())
+              canUseDirectBufferPath = false;
+
+            if (canUseDirectBufferPath) {
+              auto directGeneric = b.create<mlir::linalg::GenericOp>(
+                  loc,
+                  /*resultTensorTypes=*/TypeRange{},
+                  /*inputs=*/ValueRange{inputSubviews},
+                  /*outputs=*/ValueRange{destSubview},
+                  /*indexingMaps=*/g.getIndexingMaps(),
+                  /*iteratorTypes=*/g.getIteratorTypes(),
+                  /*doc=*/nullptr, /*libraryCall=*/nullptr);
+
+              cloneGenericRegion(g, directGeneric);
+
+              // The original generic result is expected to feed the single
+              // wrapper/materialization chain found above. After emitting the
+              // direct bufferized generic, that chain becomes dead.
+              for (Operation *op : llvm::reverse(wrappers))
+                op->erase();
+              mat.erase();
+              g.erase();
+              continue;
+            }
+          }
+        }
+
         // Slice inputs into per-core tiles.
         //
         // For chained elementwise patterns, attempt to clone compatible
@@ -855,6 +1019,7 @@ struct NSPSpmdizePass
         for (Value in : inputs)
           localInputs.push_back(materializeLocalValue(in, localTy, localCache));
 
+        // Fallback path: keep tensor-local materialization.
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
         auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
