@@ -409,10 +409,6 @@ struct NSPSpmdizePass
       return success();
     };
 
-    // ---------
-    // Main Body
-    // ---------
-
     if (!allowCollectives) {
       // In non-collective mode, prioritize loop distribution. This is the
       // required strategy for patterns with intra-tile reductions (e.g.
@@ -556,7 +552,8 @@ struct NSPSpmdizePass
       };
 
       // Strip trivial wrapper ops (shard.shard, tensor.cast) to expose a real
-      // defining op for bring-up pattern matching.
+      // defining op, that is, wrappers that may sit between a tensor value
+      // and its backing buffer.
       auto stripTrivialWrappers = [&](Value v) -> Value {
         Value cur = v;
         while (Operation *def = cur.getDefiningOp()) {
@@ -719,43 +716,14 @@ struct NSPSpmdizePass
         return local;
       };
 
-      // NEW
-      // Peel trivial wrappers that may sit between a tensor value and its
-      // backing buffer.
-      auto stripDirectBufferViewWrappers = [&](Value v) -> Value {
-        Value cur = v;
-        while (true) {
-          if (auto castOp = cur.getDefiningOp<tensor::CastOp>()) {
-            cur = castOp.getSource();
-            continue;
-          }
-          if (auto shardOp = cur.getDefiningOp<mlir::shard::ShardOp>()) {
-            cur = shardOp.getInput();
-            continue;
-          }
-          break;
-        }
-        return cur;
-      };
-
-      // Try to materialize a shard-local memref tile directly from a
-      // tensor value. when the tensor is a trivial wrapper around
-      // bufferization.to_tensor(memref).
-      //
-      // Supported pattern:
-      //   %t0 = bufferization.to_tensor %m : memref<NxT> -> tensor<NxT>
-      //   %t1 = tensor.cast %t0 : ...
-      //   %t2 = shard.shard %t1 to %sharding
-      //
-      // Result:
-      //   memref.subview %m[offset][tileSize][1]
-      //
-      // This helper is used by the direct store-by-tile fast path. When it
-      // fails, callers must fall back to the tensor-local path.
+      // Try to materialize a shard-local memref tile directly from a tensor
+      // value backed by bufferization.to_tensor, allowing trivial wrappers
+      // such as shard.shard and tensor.cast in between.
       auto tryBuildDirectInputSubview = [&](OpBuilder &builder, Value tensorV,
                                             Location loc, Value offset,
                                             int64_t tileSize) -> Value {
-        Value base = stripDirectBufferViewWrappers(tensorV);
+        // Value base = stripDirectBufferViewWrappers(tensorV);
+        Value base = stripTrivialWrappers(tensorV);
 
         auto toTensor =
             dyn_cast_or_null<bufferization::ToTensorOp>(base.getDefiningOp());
@@ -812,7 +780,6 @@ struct NSPSpmdizePass
         for (Operation &op : srcBlock.getOperations())
           nb.clone(op, map);
       };
-      // END NEW
 
       // Use a worklist since we'll rewrite in-place.
       SmallVector<mlir::linalg::GenericOp> worklist;
@@ -1015,9 +982,9 @@ struct NSPSpmdizePass
 
               cloneGenericRegion(g, directGeneric);
 
+              mat.erase();
               for (Operation *op : llvm::reverse(wrappers))
                 op->erase();
-              mat.erase();
               g.erase();
               continue;
             }
