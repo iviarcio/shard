@@ -626,6 +626,37 @@ struct NSPSpmdizePass
         return true;
       };
 
+      // Reuse one local DPS init tensor per local result type.
+      llvm::DenseMap<Type, Value> localScratchInits;
+
+      auto getOrCreateLocalScratch = [&](Location loc,
+                                         RankedTensorType localTy) -> Value {
+        auto it = localScratchInits.find(localTy);
+        if (it != localScratchInits.end())
+          return it->second;
+
+        Value scratch = b.create<mlir::tensor::EmptyOp>(
+            loc, localTy.getShape(), localTy.getElementType());
+        localScratchInits[localTy] = scratch;
+        return scratch;
+      };
+
+      // Only clone producers that form a single-use chain.
+      // For fan-out nodes, keep the main behavior and slice the
+      // already-materialized global value instead of trying to
+      // force a shared local scratch through multiple live users.
+      auto isSingleUseClonableProducer = [&](Value v) -> bool {
+        Value base = stripTrivialWrappers(v);
+        Operation *def = base.getDefiningOp();
+        if (!def)
+          return false;
+
+        if (!base.hasOneUse())
+          return false;
+
+        return isa<mlir::linalg::FillOp, mlir::linalg::GenericOp>(def);
+      };
+
       // Build a local-tile version of a global value by cloning a chain of
       // compatible elementwise producers. This avoids materializing full global
       // intermediates when only the final store is tiled.
@@ -639,24 +670,39 @@ struct NSPSpmdizePass
         if (it != cache.end())
           return it->second;
 
-        // linalg.fill: produce a local constant tile.
+        // linalg.fill: clone locally only for single-use chains.
         if (auto fill =
                 dyn_cast_or_null<mlir::linalg::FillOp>(base.getDefiningOp())) {
-          Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              fill.getLoc(), expectedLocalTy.getShape(),
-              expectedLocalTy.getElementType());
+          if (!base.hasOneUse()) {
+            Value local = mlir::shard::AllSliceOp::create(
+                              b, base.getLoc(), /*result_type=*/expectedLocalTy,
+                              /*input=*/base,
+                              /*grid=*/"nsp",
+                              /*gridAxes=*/gridAxes,
+                              /*sliceAxis=*/splitAxis)
+                              .getResult();
+            cache[base] = local;
+            return local;
+          }
+
+          Value outLocalInit =
+              getOrCreateLocalScratch(fill.getLoc(), expectedLocalTy);
+
           auto localFill = b.create<mlir::linalg::FillOp>(
               fill.getLoc(), /*inputs=*/fill.getInputs(),
               /*outputs=*/ValueRange{outLocalInit});
+
           Value localRes = localFill.getResult(0);
           cache[base] = localRes;
           return localRes;
         }
 
-        // linalg.generic: clone producer locally if compatible.
+        // linalg.generic: clone locally only when it is a compatible
+        // single-use producer.
         if (auto prod = dyn_cast_or_null<mlir::linalg::GenericOp>(
                 base.getDefiningOp())) {
-          if (isCompatibleElementwiseGeneric(prod, expectedLocalTy)) {
+          if (base.hasOneUse() &&
+              isCompatibleElementwiseGeneric(prod, expectedLocalTy)) {
             SmallVector<Value> prodInputs;
             const int64_t nIn = prod.getNumDpsInputs();
             prodInputs.reserve(nIn);
@@ -666,9 +712,8 @@ struct NSPSpmdizePass
                   materializeLocalValue(inV, expectedLocalTy, cache));
             }
 
-            Value outLocalInit = b.create<mlir::tensor::EmptyOp>(
-                prod.getLoc(), expectedLocalTy.getShape(),
-                expectedLocalTy.getElementType());
+            Value outLocalInit =
+                getOrCreateLocalScratch(prod.getLoc(), expectedLocalTy);
 
             auto newProd = b.create<mlir::linalg::GenericOp>(
                 prod.getLoc(),
@@ -1007,8 +1052,7 @@ struct NSPSpmdizePass
         Value outLocalInit = oldInit;
         auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
         if (!oldInitTy || oldInitTy != localTy) {
-          outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              loc, localTy.getShape(), localTy.getElementType());
+          outLocalInit = getOrCreateLocalScratch(loc, localTy);
         }
 
         // Clone the generic op with local operands.
