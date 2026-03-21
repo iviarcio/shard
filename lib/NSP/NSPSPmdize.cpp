@@ -1047,11 +1047,76 @@ struct NSPSpmdizePass
         for (Value in : inputs)
           localInputs.push_back(materializeLocalValue(in, localTy, localCache));
 
+        // Try to anchor the fallback tensor-local chain on the final
+        // destination tile itself. This removes the remaining output staging
+        // tensor.empty that would otherwise survive as alloc + copy + free
+        // after lowering/bufferization.
+        //
+        // We only do this in non-collective mode and only when the sink
+        // destination is a 1-D memref compatible with the local result type.
+        Value sinkBackedDestSubview;
+        Value sinkBackedInitTensor;
+        bool haveSinkBackedInit = false;
+
+        if (!allowCollectives && sink &&
+            !ShapedType::isDynamic(localTy.getDimSize(0))) {
+          auto mat = sink->first;
+          Value dest = mat->getOperand(1);
+          auto destTy = dyn_cast<MemRefType>(dest.getType());
+
+          if (destTy && destTy.getRank() == 1 &&
+              destTy.getElementType() == localTy.getElementType()) {
+            int64_t tileSize = localTy.getDimSize(0);
+
+            // Build the per-process destination tile now.
+            b.setInsertionPoint(mat);
+
+            Value procIdx =
+                b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+            Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
+            Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
+
+            SmallVector<OpFoldResult> offsets = {offset};
+            SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};
+            SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};
+
+            auto subLayout = StridedLayoutAttr::get(
+                destTy.getContext(), /*offset=*/ShapedType::kDynamic,
+                /*strides=*/ArrayRef<int64_t>{1});
+            auto subTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
+                                         destTy.getElementType(), subLayout,
+                                         destTy.getMemorySpace());
+
+            sinkBackedDestSubview = b.create<memref::SubViewOp>(
+                loc, subTy, dest, offsets, sizes, strides);
+
+            // Turn the destination slice into a writable tensor init.
+            //
+            // NOTE: if your local ToTensorOp builder signature differs,
+            // adapt this line to the exact API in your tree while preserving
+            // the same semantics (writable + restrict).
+            sinkBackedInitTensor = b.create<bufferization::ToTensorOp>(
+                loc, localTy, sinkBackedDestSubview,
+                /*restrict=*/true,
+                /*writable=*/true);
+
+            haveSinkBackedInit = true;
+          }
+        }
+
+        // If available, seed the scratch cache with the destination-backed
+        // tensor so the final local chain uses the real output tile instead of
+        // a synthetic tensor.empty staging buffer.
+        if (haveSinkBackedInit)
+          localScratchInits[localTy] = sinkBackedInitTensor;
+
         // Fallback path: keep tensor-local materialization.
         // Create (or reuse) a local init tensor for the output.
         Value outLocalInit = oldInit;
         auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
-        if (!oldInitTy || oldInitTy != localTy) {
+        if (haveSinkBackedInit) {
+          outLocalInit = sinkBackedInitTensor;
+        } else if (!oldInitTy || oldInitTy != localTy) {
           outLocalInit = getOrCreateLocalScratch(loc, localTy);
         }
 
@@ -1088,6 +1153,22 @@ struct NSPSpmdizePass
                   /*gather_axis=*/splitAxisAP)
                   .getResult();
           g.getResult(0).replaceAllUsesWith(globalResult);
+          g.erase();
+          continue;
+        }
+
+        // If the local chain was anchored on a destination-backed tensor,
+        // materialize_in_destination is now redundant: the final result has
+        // already been computed directly into the per-process output tile.
+        if (haveSinkBackedInit) {
+          auto mat = sink->first;
+          auto &wrappers = sink->second;
+
+          mat.erase();
+          for (Operation *op : llvm::reverse(wrappers))
+            op->erase();
+
+          // Erase the original global generic.
           g.erase();
           continue;
         }
