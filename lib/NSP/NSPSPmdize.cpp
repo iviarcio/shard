@@ -722,7 +722,7 @@ struct NSPSpmdizePass
       auto tryBuildDirectInputSubview = [&](OpBuilder &builder, Value tensorV,
                                             Location loc, Value offset,
                                             int64_t tileSize) -> Value {
-        // Value base = stripDirectBufferViewWrappers(tensorV);
+
         Value base = stripTrivialWrappers(tensorV);
 
         auto toTensor =
