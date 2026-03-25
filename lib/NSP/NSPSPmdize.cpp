@@ -59,6 +59,136 @@ namespace hexagon {
 
 namespace {
 
+//===----------------------------------------------------------------------===//
+// Localize: build tensor-based local linalg.generic and attach attributes
+//===----------------------------------------------------------------------===//
+static FailureOr<linalg::GenericOp>
+localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
+                        RankedTensorType localTy, ArrayRef<Value> localInputs,
+                        Value oldInit) {
+  Location loc = g.getLoc();
+
+  // Reuse the existing init tensor when it already matches the local type.
+  Value outLocalInit = oldInit;
+  auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
+  if (!oldInitTy || oldInitTy != localTy) {
+    outLocalInit = b.create<tensor::EmptyOp>(loc, localTy.getShape(),
+                                             localTy.getElementType());
+  }
+
+  auto localizedGeneric =
+      b.create<linalg::GenericOp>(loc,
+                                  /*resultTensorTypes=*/TypeRange{localTy},
+                                  /*inputs=*/ValueRange{localInputs},
+                                  /*outputs=*/ValueRange{outLocalInit},
+                                  /*indexingMaps=*/g.getIndexingMaps(),
+                                  /*iteratorTypes=*/g.getIteratorTypes(),
+                                  /*doc=*/nullptr, /*libraryCall=*/nullptr);
+
+  // Move the region body from the original generic into the localized one.
+  localizedGeneric.getRegion().takeBody(g.getRegion());
+
+  // Base contract marker. The tile-specific attrs are attached later, once
+  // tileSize is known from the localized result type.
+  localizedGeneric->setAttr("nsp.localized", b.getUnitAttr());
+
+  return localizedGeneric;
+}
+
+//===----------------------------------------------------------------------===//
+// Materialize: rewrite the existing sink to store the local tile into a subview
+//===----------------------------------------------------------------------===//
+static LogicalResult
+materializeTileToDestination(OpBuilder &b, linalg::GenericOp localizedGeneric,
+                             bufferization::MaterializeInDestinationOp mat,
+                             ArrayRef<Operation *> wrappers,
+                             linalg::GenericOp originalGeneric, Value procIdx) {
+
+  if (!localizedGeneric->hasAttr("nsp.localized"))
+    return failure();
+
+  auto tileSizeAttr =
+      localizedGeneric->getAttrOfType<IntegerAttr>("nsp.materialize_tile_size");
+  auto splitAxisAttr = localizedGeneric->getAttrOfType<IntegerAttr>(
+      "nsp.materialize_split_axis");
+
+  if (!tileSizeAttr || !splitAxisAttr)
+    return failure();
+
+  Location loc = localizedGeneric.getLoc();
+  int64_t tileSize = tileSizeAttr.getInt();
+  int64_t splitAxis = splitAxisAttr.getInt();
+
+  Value dest = mat.getOperand(1);
+  auto destTy = dyn_cast<MemRefType>(dest.getType());
+  if (!destTy)
+    return failure();
+
+  if (splitAxis < 0 || splitAxis >= destTy.getRank())
+    return failure();
+
+  b.setInsertionPoint(mat);
+
+  Value tileSizeVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
+  Value offset = b.create<arith::MulIOp>(loc, procIdx, tileSizeVal);
+
+  SmallVector<OpFoldResult> offsets, sizes, strides;
+  offsets.reserve(destTy.getRank());
+  sizes.reserve(destTy.getRank());
+  strides.reserve(destTy.getRank());
+
+  for (int64_t i = 0; i < destTy.getRank(); ++i) {
+    strides.push_back(b.getIndexAttr(1));
+    if (i == splitAxis) {
+      offsets.push_back(offset);
+      sizes.push_back(b.getIndexAttr(tileSize));
+    } else {
+      offsets.push_back(b.getIndexAttr(0));
+      int64_t dim = destTy.getDimSize(i);
+      if (ShapedType::isDynamic(dim))
+        return failure();
+      sizes.push_back(b.getIndexAttr(dim));
+    }
+  }
+
+  MemRefType subviewTy;
+  if (destTy.getRank() == 1) {
+    auto subLayout = StridedLayoutAttr::get(destTy.getContext(),
+                                            /*offset=*/ShapedType::kDynamic,
+                                            /*strides=*/ArrayRef<int64_t>{1});
+    subviewTy =
+        MemRefType::get(ArrayRef<int64_t>{tileSize}, destTy.getElementType(),
+                        subLayout, destTy.getMemorySpace());
+  }
+
+  Value destSubview =
+      subviewTy
+          ? b.create<memref::SubViewOp>(loc, subviewTy, dest, offsets, sizes,
+                                        strides)
+          : b.create<memref::SubViewOp>(loc, dest, offsets, sizes, strides);
+
+  // Rewrite the pre-existing sink instead of creating a second one.
+  mat->setOperand(0, localizedGeneric.getResult(0));
+  mat->setOperand(1, destSubview);
+
+  for (Operation *op : llvm::reverse(wrappers))
+    op->erase();
+
+  // Erase the original global generic now that the sink points to the local
+  // one.
+  originalGeneric.erase();
+
+  // Cleanup the temporary contract attrs.
+  localizedGeneric->removeAttr("nsp.localized");
+  localizedGeneric->removeAttr("nsp.materialize_tile_size");
+  localizedGeneric->removeAttr("nsp.materialize_split_axis");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NSP SPMDization/materialization pass.
+//===----------------------------------------------------------------------===//
 struct NSPSpmdizePass
     : public PassWrapper<NSPSpmdizePass, OperationPass<ModuleOp>> {
 
@@ -722,7 +852,6 @@ struct NSPSpmdizePass
       auto tryBuildDirectInputSubview = [&](OpBuilder &builder, Value tensorV,
                                             Location loc, Value offset,
                                             int64_t tileSize) -> Value {
-
         Value base = stripTrivialWrappers(tensorV);
 
         auto toTensor =
@@ -1003,46 +1132,37 @@ struct NSPSpmdizePass
           localInputs.push_back(materializeLocalValue(in, localTy, localCache));
 
         // Fallback path: keep tensor-local materialization.
-        // Create (or reuse) a local init tensor for the output.
-        Value outLocalInit = oldInit;
-        auto oldInitTy = dyn_cast<RankedTensorType>(oldInit.getType());
-        if (!oldInitTy || oldInitTy != localTy) {
-          outLocalInit = b.create<mlir::tensor::EmptyOp>(
-              loc, localTy.getShape(), localTy.getElementType());
+        auto localizedOrFail =
+            localizeGenericToTensor(b, g, localTy, localInputs, oldInit);
+        if (failed(localizedOrFail)) {
+          signalPassFailure();
+          return;
         }
 
-        // Clone the generic op with local operands.
-        auto newGeneric = b.create<mlir::linalg::GenericOp>(
-            loc, /*resultTensorTypes=*/TypeRange{localTy},
-            /*inputs=*/ValueRange{localInputs},
-            /*outputs=*/ValueRange{outLocalInit},
-            /*indexingMaps=*/g.getIndexingMaps(),
-            /*iteratorTypes=*/g.getIteratorTypes(),
-            /*doc=*/nullptr, /*libraryCall=*/nullptr);
-
-        // Move the region body (elementwise computation) over.
-        newGeneric.getRegion().takeBody(g.getRegion());
+        auto localizedGeneric = *localizedOrFail;
 
         // Materialization policy:
         // -----------------------
-        // *allowCollectives=true reconstitute a global tensor via
-        // shard.all_gather and keep the existing destination materialization.
+        // * allowCollectives=true:
+        //     reconstitute a global tensor via shard.all_gather and keep the
+        //     existing destination materialization.
         //
-        // *allowCollectives=false store the local tile directly into a
-        // subview of the global destination (store-by-tile), avoiding
-        // communication.
-
-        Value localResult = newGeneric.getResult(0);
+        // * allowCollectives=false:
+        //     store the local tile directly into a subview of the global
+        //     destination (store-by-tile), avoiding communication.
+        Value localResult = localizedGeneric.getResult(0);
 
         if (allowCollectives) {
           Value globalResult =
               mlir::shard::AllGatherOp::create(
-                  b, loc, /*result=*/outResTy,
+                  b, loc,
+                  /*result=*/outResTy,
                   /*grid=*/"nsp",
                   /*grid_axes=*/llvm::ArrayRef<int16_t>(gridAxesI16),
                   /*input=*/localResult,
                   /*gather_axis=*/splitAxisAP)
                   .getResult();
+
           g.getResult(0).replaceAllUsesWith(globalResult);
           g.erase();
           continue;
@@ -1052,66 +1172,66 @@ struct NSPSpmdizePass
         auto mat = sink->first;
         auto &wrappers = sink->second;
 
-        // Destination must be a 1D memref.
         Value dest = mat->getOperand(1);
         auto destTy = dyn_cast<MemRefType>(dest.getType());
-        if (!destTy || destTy.getRank() != 1) {
-          mat.emitError() << "NSPSpmdize: expected a 1D memref destination in "
-                             "bufferization.materialize_in_destination";
+        if (!destTy) {
+          g.emitError()
+              << "NSPSpmdize: destination of materialize_in_destination is not "
+                 "a memref";
+          signalPassFailure();
+          return;
+        }
+
+        // Initial bring-up only supports rank-1 direct store-by-tile.
+        if (destTy.getRank() != 1) {
+          g.emitError()
+              << "NSPSpmdize: non-collective direct materialization currently "
+                 "supports only rank-1 destinations";
           signalPassFailure();
           return;
         }
 
         auto localResTy = dyn_cast<RankedTensorType>(localResult.getType());
-        int64_t tileSize = localResTy.getDimSize(0);
-        if (ShapedType::isDynamic(tileSize)) {
-          mat.emitError()
-              << "NSPSpmdize: store-by-tile requires a static tile size";
+        if (!localResTy || localResTy.getRank() != 1) {
+          g.emitError()
+              << "NSPSpmdize: local result must be a rank-1 tensor in "
+                 "non-collective mode";
           signalPassFailure();
           return;
         }
 
-        // Insert offset/subview computation right before the materialization.
+        int64_t tileSize = localResTy.getDimSize(0);
+        if (ShapedType::isDynamic(tileSize) || tileSize <= 0) {
+          g.emitError()
+              << "NSPSpmdize: local tile size must be static and positive";
+          signalPassFailure();
+          return;
+        }
+
+        // Compute the participant index and attach the contract attrs that the
+        // materialization helper consumes.
         b.setInsertionPoint(mat);
+        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(
+            loc, b.getIndexType(), grid.getSymName());
 
-        // procIdx is an index in [0, numShards).
-        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
+        localizedGeneric->setAttr("nsp.materialize_tile_size",
+                                  b.getI64IntegerAttr(tileSize));
+        localizedGeneric->setAttr("nsp.materialize_split_axis",
+                                  b.getI64IntegerAttr(splitAxis));
 
-        // offset = procIdx * tileSize
-        Value cTileVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
-        Value offset = b.create<arith::MulIOp>(loc, procIdx, cTileVal);
+        if (failed(materializeTileToDestination(b, localizedGeneric, mat,
+                                                wrappers, g, procIdx))) {
+          g.emitError() << "NSPSpmdize: failed to materialize local tile into "
+                           "destination";
+          signalPassFailure();
+          return;
+        }
 
-        SmallVector<OpFoldResult> offsets = {offset}; // dynamic offset
-        SmallVector<OpFoldResult> sizes = {
-            b.getIndexAttr(tileSize)}; // static size
-        SmallVector<OpFoldResult> strides = {
-            b.getIndexAttr(1)}; // static stride
+        continue;
 
-        // Create a subview into the destination buffer corresponding to this
-        // process' tile.
-        auto subLayout = StridedLayoutAttr::get(
-            destTy.getContext(), /*offset=*/ShapedType::kDynamic,
-            /*strides=*/ArrayRef<int64_t>{1});
-        auto subTy = MemRefType::get(ArrayRef<int64_t>{tileSize},
-                                     destTy.getElementType(), subLayout,
-                                     destTy.getMemorySpace());
-
-        Value destSubview = b.create<memref::SubViewOp>(
-            loc, subTy, dest, offsets, sizes, strides);
-
-        // Rewrite the materialization to store only this tile.
-        mat->setOperand(0, localResult);
-        mat->setOperand(1, destSubview);
-
-        // Wrapper chain is now dead; erase in reverse order.
-        for (Operation *op : llvm::reverse(wrappers))
-          op->erase();
-
-        // Erase the original global generic.
-        g.erase();
-      }
-    });
-  }
+      } // for worklist
+    }); // module.walk
+  } // runOnOperation
 
 private:
 };
