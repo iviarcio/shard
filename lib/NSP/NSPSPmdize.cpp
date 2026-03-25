@@ -1211,8 +1211,7 @@ struct NSPSpmdizePass
         // Compute the participant index and attach the contract attrs that the
         // materialization helper consumes.
         b.setInsertionPoint(mat);
-        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(
-            loc, b.getIndexType(), grid.getSymName());
+        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
 
         localizedGeneric->setAttr("nsp.materialize_tile_size",
                                   b.getI64IntegerAttr(tileSize));
