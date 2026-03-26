@@ -1,7 +1,8 @@
 add_mlir_library(MLIRNSP
   NSPShardInterfaceModels.cpp
   NSPShardPlanner.cpp
-  NSPSpmdize.cpp
+  NSPLocalizePass.cpp
+  NSPMaterializePass.cpp
   NSPPasses.cpp
 
   LINK_LIBS PUBLIC

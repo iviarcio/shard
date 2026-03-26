@@ -30,9 +30,11 @@ namespace hexagon {
 std::unique_ptr<mlir::Pass> createNSPShardPlannerPass();
 std::unique_ptr<mlir::Pass> createNSPShardPlannerPass(int64_t nspCount, bool allowCollectives);
 
-/// Factory for the NSP SPMDization/materialization pass.
-std::unique_ptr<mlir::Pass> createNSPSpmdizePass();
-std::unique_ptr<mlir::Pass> createNSPSpmdizePass(bool allowCollectives);
+/// Factories for the NSP Localization/Materialization passes.
+std::unique_ptr<mlir::Pass> createNSPLocalizePass();
+std::unique_ptr<mlir::Pass> createNSPLocalizePass(bool allowCollectives);
+
+std::unique_ptr<mlir::Pass> createNSPMaterializePass();
 
 /// Register individual NSP passes (e.g., planner, materialization) so they are
 /// visible to the MLIR pass registry (e.g., --list-passes).

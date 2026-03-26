@@ -48,8 +48,10 @@ std::unique_ptr<Pass> createNSPShardPlannerPass();
 std::unique_ptr<Pass> createNSPShardPlannerPass(int64_t nspCount,
                                                 bool allowCollectives);
 
-std::unique_ptr<Pass> createNSPSpmdizePass();
-std::unique_ptr<Pass> createNSPSpmdizePass(bool allowCollectives);
+std::unique_ptr<Pass> createNSPLocalizePass();
+std::unique_ptr<Pass> createNSPLocalizePass(bool allowCollectives);
+
+std::unique_ptr<Pass> createNSPMaterializePass();
 
 // From NSPShardInterfaceModels.cpp (attach external models).
 void registerNSPShardInterfaceModels(DialectRegistry &registry);
@@ -90,8 +92,16 @@ struct NSPShardPipelineOptions
 /// Build the canonical NSP shard pipeline. At high-level:
 ///  1. Planner: attach shard annotations (device mesh + tensor layout).
 ///  2. Propagation: infer missing shardings using ShardingInterface.
-///  3. SPMDization: lower shard IR to explicit slices + collectives.
-///  4. Cleanup: canonicalize/CSE.
+///  3. Localization: rewrite supported shard-annotated compute into
+///     per-NSP local tensor compute while preserving pure tensor semantics.
+///  4. Materialization: connect localized results to destination buffers
+///     using explicit per-NSP subviews / store-by-tile rewrites.
+///  5. Cleanup: canonicalize/CSE.
+///
+/// Note:
+///   The split between localization and materialization is intentional:
+///   tiling/vectorization may run in between these two passes, while the IR
+///   still has pure tensor semantics after localization.
 static void buildNSPShardPipeline(OpPassManager &pm,
                                   const NSPShardPipelineOptions &opts) {
 
@@ -114,17 +124,35 @@ static void buildNSPShardPipeline(OpPassManager &pm,
     pm.addPass(createCSEPass());
   }
 
-  // 3. SPMDization / materialization
-  // - compute per-NSP tensor slices (extract_slice/subview),
-  // - materialize collectives (all-reduce/all-gather/all-to-all),
-  // - rewrite compute ops to operate on local tiles.
-  pm.addPass(createNSPSpmdizePass(opts.allowCollectives));
+  // 3. Localization
+  // - rewrite supported shard-annotated compute into per-NSP local tensor
+  //   compute,
+  // - preserve pure tensor semantics so downstream tiling/vectorization can
+  //   still match linalg ops.
+  pm.addPass(createNSPLocalizePass(opts.allowCollectives));
 
-  // 4. Cleanup
+  // Optional cleanup boundary before downstream tiling/vectorization.
   if (opts.canonicalize) {
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
   }
+
+  // NOTE:
+  //   Hexagon tiling/vectorization may be inserted here in a later pipeline
+  //   stage, between NSP localization and NSP materialization.
+
+  // 4. Materialization
+  // - reconnect localized results to destination buffers,
+  // - compute per-NSP offsets via shard.process_linear_index,
+  // - rewrite sinks into explicit subviews / store-by-tile form.
+  pm.addPass(createNSPMaterializePass());
+
+  // 5. Cleanup
+  if (opts.canonicalize) {
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+  }
+
 }
 
 } // namespace
@@ -146,14 +174,16 @@ void registerNSPPasses() {
   registerPass(
       []() -> std::unique_ptr<Pass> { return createNSPShardPlannerPass(); });
   registerPass(
-      []() -> std::unique_ptr<Pass> { return createNSPSpmdizePass(); });
+      []() -> std::unique_ptr<Pass> { return createNSPLocalizePass(); });
+  registerPass(
+      []() -> std::unique_ptr<Pass> { return createNSPMaterializePass(); });
 }
 
 /// Register NSP pipelines.
 void registerNSPPipelines() {
   PassPipelineRegistration<NSPShardPipelineOptions>(
       "nsp-shard",
-      "NSP pipeline: shard planning -> sharding propagation -> SPMDization",
+      "NSP pipeline: shard planning -> Propagation -> Localization -> Materialization",
       buildNSPShardPipeline);
 }
 
