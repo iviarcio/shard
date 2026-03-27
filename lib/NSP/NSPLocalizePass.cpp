@@ -20,22 +20,19 @@
 //   - optional reconstitution using shard.all_gather when collectives are
 //     enabled and a global tensor value must be preserved
 //
-// In non-collective mode, this pass leaves the final destination
-// materialization for a later NSPMaterializePass. To make that hand-off
-// explicit, it attaches temporary NSP attributes to the localized generic:
-//   - nsp.localized
-//   - nsp.materialize_tile_size
-//   - nsp.materialize_split_axis
-//   - nsp.group_id
+// In non-collective mode, this pass makes the hand-off to the later
+// NSPMaterializePass explicit by creating an `nsp.materialize_tile` op.
+// That op anchors the final destination materialization without keeping the
+// original global linalg.generic alive in the IR.
 //
 // Expected IR (high level):
 //   - A shard.grid symbol exists in the module (e.g. @nsp).
 //   - Sharding descriptors (!shard.sharding) are produced and attached/used
 //     as part of the propagation/planning flow.
-//   - In non-collective mode, only computations with an identifiable
-//     materialize_in_destination sink are localized, so the later
-//     NSPMaterializePass can reconnect the shard-local result to the original
-//     destination.
+//   - In non-collective mode, computations with an identifiable
+//     materialize_in_destination sink are rewritten into:
+//         * shard-local tensor compute
+//         * nsp.materialize_tile for the final destination hand-off
 //
 //===----------------------------------------------------------------------===//
 
@@ -69,6 +66,10 @@
 #include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
 
+// NSP dialect ops/types.
+#include "hexagon/NSP/IR/NSPDialect.h"
+#include "hexagon/NSP/IR/NSPOps.h"
+
 namespace mlir {
 namespace hexagon {
 
@@ -80,7 +81,7 @@ namespace {
 static FailureOr<linalg::GenericOp>
 localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
                         RankedTensorType localTy, ArrayRef<Value> localInputs,
-                        Value oldInit, int64_t splitAxis, int64_t groupId) {
+                        Value oldInit, int64_t splitAxis) {
   Location loc = g.getLoc();
 
   // Reuse the existing init tensor when it already matches the local type.
@@ -131,7 +132,6 @@ localizeGenericToTensor(OpBuilder &b, linalg::GenericOp g,
                             b.getI64IntegerAttr(tileSize));
   localizedGeneric->setAttr("nsp.materialize_split_axis",
                             b.getI64IntegerAttr(splitAxis));
-  localizedGeneric->setAttr("nsp.group_id", b.getI64IntegerAttr(groupId));
 
   return localizedGeneric;
 }
@@ -182,6 +182,7 @@ struct NSPLocalizePass
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
+    ctx->getOrLoadDialect<mlir::hexagon::nsp::NSPDialect>();
 
     ModuleOp module = getOperation();
 
@@ -212,10 +213,6 @@ struct NSPLocalizePass
       signalPassFailure();
       return;
     }
-
-    // Stable identifier used to relate the original global op and the
-    // shard-local tensor op across the localize/materialize split.
-    int64_t nextGroupId = 0;
 
     // HELPER for strip shard tensor annotations inside loops that were
     // explicitly distributed by this pass (marked with 'nsp.distributed').
@@ -933,9 +930,10 @@ struct NSPLocalizePass
         localInputs.reserve(numInputs);
         for (Value in : inputs)
           localInputs.push_back(materializeLocalValue(in, localTy, localCache));
+
         // Localize this computation into shard-local tensor semantics.
-        auto localizedOrFail = localizeGenericToTensor(
-            b, g, localTy, localInputs, oldInit, splitAxis, nextGroupId);
+        auto localizedOrFail =
+            localizeGenericToTensor(b, g, localTy, localInputs, oldInit, splitAxis);
         if (failed(localizedOrFail)) {
           g.emitError() << "NSPLocalize: failed to build localized tensor "
                            "generic";
@@ -958,24 +956,65 @@ struct NSPLocalizePass
                   .getResult();
 
           g.getResult(0).replaceAllUsesWith(globalResult);
-          g.erase();
 
           localizedGeneric->removeAttr("nsp.localized");
           localizedGeneric->removeAttr("nsp.materialize_tile_size");
           localizedGeneric->removeAttr("nsp.materialize_split_axis");
-          localizedGeneric->removeAttr("nsp.group_id");
 
+          g.erase();
           continue;
         }
 
-        // In non-collective mode, keep both the original global generic and
-        // the localized tensor generic alive. A later NSPMaterializePass will
-        // rediscover the original sink, compute the destination subview, and
-        // reconnect the localized result to that sink using the shared group
-        // id.
-        g->setAttr("nsp.group_id", b.getI64IntegerAttr(nextGroupId));
-        ++nextGroupId;
-        (void)localizedGeneric;
+        // In non-collective mode, replace the old split-pass contract
+        // ("keep the original global generic alive and correlate via group_id")
+        // with an explicit NSP IR anchor that carries the later destination
+        // materialization.
+        //
+        // We already know this generic has a valid materialize_in_destination sink
+        // because `sink` was required above in non-collective mode.
+        auto mat = sink->first;
+        auto &wrappers = sink->second;
+
+        Value dest = mat.getOperand(1);
+        auto destTy = dyn_cast<MemRefType>(dest.getType());
+        if (!destTy) {
+          g.emitError()
+              << "NSPLocalize: destination of materialize_in_destination is not "
+                 "a memref";
+          signalPassFailure();
+          return;
+        }
+
+        auto tileSizeAttr =
+            localizedGeneric->getAttrOfType<IntegerAttr>("nsp.materialize_tile_size");
+        auto splitAxisAttr =
+            localizedGeneric->getAttrOfType<IntegerAttr>("nsp.materialize_split_axis");
+
+        if (!tileSizeAttr || !splitAxisAttr) {
+          localizedGeneric.emitError()
+              << "NSPLocalize: localized generic is missing tile materialization "
+                 "attributes";
+          signalPassFailure();
+          return;
+        }
+
+        // Emit the explicit hand-off op for NSPMaterializePass.
+        b.setInsertionPoint(mat);
+        b.create<mlir::hexagon::nsp::MaterializeTileOp>(
+            loc,
+            /*source=*/localResult,
+            /*dest=*/dest,
+            /*grid=*/SymbolRefAttr::get(ctx, grid.getSymName()),
+            /*splitAxis=*/splitAxisAttr,
+            /*tileSize=*/tileSizeAttr);
+
+        // The old sink chain is now replaced by the explicit NSP materialization
+        // anchor, so the old sink/wrappers/global generic can go away now.
+        mat.erase();
+        for (Operation *op : llvm::reverse(wrappers))
+          op->erase();
+        g.erase();
+
         continue;
 
       } // for worklist

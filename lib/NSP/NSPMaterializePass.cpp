@@ -7,34 +7,21 @@
 //
 // NSP materialization pass.
 //
-// This pass performs the destination-materialization half of the split NSP
-// bring-up pipeline for multi-core execution. It expects that a prior
-// NSPLocalizePass has:
-//   - cloned supported sharded elementwise computations into shard-local
-//     tensor semantics,
-//   - left the original global tensor producer intact,
-//   - attached the following temporary attributes to the shard-local generic:
-//       * nsp.localized
-//       * nsp.materialize_tile_size
-//       * nsp.materialize_split_axis
-//       * nsp.group_id
-//   - attached nsp.group_id to the original global generic as well.
+// This pass consumes the explicit `nsp.materialize_tile` hand-off operation
+// emitted by NSPLocalizePass in non-collective mode.
 //
-// For each localized/global pair, this pass:
-//   1. re-discovers the original materialize_in_destination sink from the
-//      global generic result,
-//   2. computes the participant-local tile offset using
+// For each `nsp.materialize_tile %tile into %dest grid @g ...`, the pass:
+//   1. computes the participant-local tile offset using
 //      shard.process_linear_index,
-//   3. creates a memref.subview into the destination buffer,
-//   4. rewrites the existing materialization sink to store the shard-local
-//      tensor into that subview,
-//   5. erases the trivial wrapper chain and the original global generic.
+//   2. creates a memref.subview into the final destination buffer,
+//   3. materializes the shard-local tensor tile into that subview using
+//      bufferization.materialize_in_destination,
+//   4. erases the temporary NSP hand-off op.
 //
 // Bring-up constraints:
-//   - only handles localized linalg.generic ops produced by NSPLocalizePass,
-//   - only handles destinations reachable through a single-use wrapper chain
-//     consisting of shard.shard and optional tensor.cast,
-//   - only handles rank-1 direct store-by-tile materialization.
+//   - only handles rank-1 direct store-by-tile materialization,
+//   - expects static tile size,
+//   - expects a valid shard.grid symbol referenced by the NSP op.
 //
 // Expected pipeline shape:
 //   planner -> propagation -> nsp-localize -> tiling/vectorization
@@ -46,13 +33,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-
-#include <optional>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -64,115 +48,62 @@
 #include "mlir/Dialect/Shard/IR/ShardDialect.h"
 #include "mlir/Dialect/Shard/IR/ShardOps.h"
 
+#include "hexagon/NSP/IR/NSPDialect.h"
+#include "hexagon/NSP/IR/NSPOps.h"
+
 namespace mlir {
 namespace hexagon {
 
 namespace {
 
-// Find a bufferization.materialize_in_destination sink for `v` while allowing
-// a trivial chain of sharding wrappers.
-//
-// This mirrors the discovery logic used by the original monolithic
-// NSPSpmdize pass so the split localize/materialize pipeline preserves the
-// previous sink-finding behavior.
-static std::optional<std::pair<bufferization::MaterializeInDestinationOp,
-                               SmallVector<Operation *>>>
-findMaterializeSink(Value v) {
-  SmallVector<Operation *> wrappers;
-  Value cur = v;
+static FailureOr<mlir::shard::GridOp>
+lookupGrid(Operation *op, FlatSymbolRefAttr gridAttr) {
+  if (!gridAttr)
+    return failure();
 
-  while (true) {
-    if (!cur.hasOneUse())
-      return std::nullopt;
+  auto grid = SymbolTable::lookupNearestSymbolFrom<mlir::shard::GridOp>(op,
+                                                                        gridAttr);
+  if (!grid)
+    return failure();
 
-    Operation *user = *cur.getUsers().begin();
-
-    if (auto shardOp = dyn_cast<mlir::shard::ShardOp>(user)) {
-      if (shardOp->getNumOperands() < 1 || shardOp->getOperand(0) != cur)
-        return std::nullopt;
-      wrappers.push_back(user);
-      cur = shardOp->getResult(0);
-      continue;
-    }
-
-    if (auto castOp = dyn_cast<tensor::CastOp>(user)) {
-      if (castOp.getSource() != cur)
-        return std::nullopt;
-      wrappers.push_back(user);
-      cur = castOp.getResult();
-      continue;
-    }
-
-    if (auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(user)) {
-      if (mat->getOperand(0) != cur)
-        return std::nullopt;
-      return std::make_optional(std::make_pair(mat, wrappers));
-    }
-
-    return std::nullopt;
-  }
+  return grid;
 }
 
-// Rewrite the existing sink to materialize a shard-local tensor tile into a
-// subview of the final destination buffer.
-static LogicalResult
-materializeTileToDestination(OpBuilder &b, linalg::GenericOp localizedGeneric,
-                             bufferization::MaterializeInDestinationOp mat,
-                             ArrayRef<Operation *> wrappers,
-                             linalg::GenericOp originalGeneric, Value procIdx) {
+static LogicalResult materializeTileToDestination(
+    OpBuilder &b, mlir::hexagon::nsp::MaterializeTileOp tileOp,
+    mlir::shard::GridOp grid) {
+  Location loc = tileOp.getLoc();
 
-  if (!localizedGeneric->hasAttr("nsp.localized"))
-    return failure();
+  Value source = tileOp.getSource();
+  Value dest = tileOp.getDest();
 
-  auto tileSizeAttr =
-      localizedGeneric->getAttrOfType<IntegerAttr>("nsp.materialize_tile_size");
-  auto splitAxisAttr = localizedGeneric->getAttrOfType<IntegerAttr>(
-      "nsp.materialize_split_axis");
-  if (!tileSizeAttr || !splitAxisAttr)
-    return failure();
-
-  Location loc = localizedGeneric.getLoc();
-  int64_t tileSize = tileSizeAttr.getInt();
-  int64_t splitAxis = splitAxisAttr.getInt();
-
-  Value dest = mat.getOperand(1);
+  auto sourceTy = dyn_cast<RankedTensorType>(source.getType());
   auto destTy = dyn_cast<MemRefType>(dest.getType());
-  if (!destTy)
+  if (!sourceTy || !destTy)
     return failure();
 
-  if (destTy.getRank() != 1)
+  // Keep bring-up constraints aligned with the current NSPLocalizePass.
+  if (sourceTy.getRank() != 1 || destTy.getRank() != 1)
     return failure();
 
-  if (splitAxis < 0 || splitAxis >= destTy.getRank())
+  int64_t splitAxis = tileOp.getSplitAxis();
+  int64_t tileSize = tileOp.getTileSize();
+  if (splitAxis != 0 || tileSize <= 0)
     return failure();
 
-  b.setInsertionPoint(mat);
+  b.setInsertionPoint(tileOp);
 
+  Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
   Value tileSizeVal = b.create<arith::ConstantIndexOp>(loc, tileSize);
   Value offset = b.create<arith::MulIOp>(loc, procIdx, tileSizeVal);
 
-  SmallVector<OpFoldResult> offsets, sizes, strides;
-  offsets.reserve(destTy.getRank());
-  sizes.reserve(destTy.getRank());
-  strides.reserve(destTy.getRank());
+  SmallVector<OpFoldResult> offsets = {offset};
+  SmallVector<OpFoldResult> sizes = {b.getIndexAttr(tileSize)};
+  SmallVector<OpFoldResult> strides = {b.getIndexAttr(1)};
 
-  for (int64_t i = 0; i < destTy.getRank(); ++i) {
-    strides.push_back(b.getIndexAttr(1));
-    if (i == splitAxis) {
-      offsets.push_back(offset);
-      sizes.push_back(b.getIndexAttr(tileSize));
-    } else {
-      offsets.push_back(b.getIndexAttr(0));
-      int64_t dim = destTy.getDimSize(i);
-      if (ShapedType::isDynamic(dim))
-        return failure();
-      sizes.push_back(b.getIndexAttr(dim));
-    }
-  }
-
-  auto subLayout = StridedLayoutAttr::get(destTy.getContext(),
-                                          /*offset=*/ShapedType::kDynamic,
-                                          /*strides=*/ArrayRef<int64_t>{1});
+  auto subLayout = StridedLayoutAttr::get(
+      destTy.getContext(), /*offset=*/ShapedType::kDynamic,
+      /*strides=*/ArrayRef<int64_t>{1});
   auto subviewTy =
       MemRefType::get(ArrayRef<int64_t>{tileSize}, destTy.getElementType(),
                       subLayout, destTy.getMemorySpace());
@@ -180,21 +111,16 @@ materializeTileToDestination(OpBuilder &b, linalg::GenericOp localizedGeneric,
   Value destSubview = b.create<memref::SubViewOp>(loc, subviewTy, dest, offsets,
                                                   sizes, strides);
 
-  // Reuse the pre-existing sink instead of creating a second
-  // materialize_in_destination op.
-  mat->setOperand(0, localizedGeneric.getResult(0));
-  mat->setOperand(1, destSubview);
+  b.create<bufferization::MaterializeInDestinationOp>(loc, source, destSubview);
 
-  for (Operation *op : llvm::reverse(wrappers))
-    op->erase();
+  if (auto localizedGeneric = source.getDefiningOp<linalg::GenericOp>()) {
+    localizedGeneric->removeAttr("nsp.localized");
+    localizedGeneric->removeAttr("nsp.materialize_tile_size");
+    localizedGeneric->removeAttr("nsp.materialize_split_axis");
+    localizedGeneric->removeAttr("nsp.group_id");
+  }
 
-  originalGeneric.erase();
-
-  localizedGeneric->removeAttr("nsp.localized");
-  localizedGeneric->removeAttr("nsp.materialize_tile_size");
-  localizedGeneric->removeAttr("nsp.materialize_split_axis");
-  localizedGeneric->removeAttr("nsp.group_id");
-
+  tileOp.erase();
   return success();
 }
 
@@ -208,101 +134,45 @@ struct NSPMaterializePass
     return "Materialize shard-local tensor results into destination memrefs";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::shard::ShardDialect, mlir::arith::ArithDialect,
+                    mlir::bufferization::BufferizationDialect,
+                    mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                    mlir::memref::MemRefDialect, mlir::tensor::TensorDialect,
+                    mlir::hexagon::nsp::NSPDialect>();
+  }
+
   void runOnOperation() final {
-    MLIRContext *ctx = &getContext();
-
-    ctx->getOrLoadDialect<mlir::shard::ShardDialect>();
-    ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
-    ctx->getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
-    ctx->getOrLoadDialect<mlir::func::FuncDialect>();
-    ctx->getOrLoadDialect<mlir::linalg::LinalgDialect>();
-    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
-    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
-
     ModuleOp module = getOperation();
 
-    auto grid = module.lookupSymbol<mlir::shard::GridOp>("nsp");
-    if (!grid) {
-      module.emitError()
-          << "NSPMaterializePass expected a 'shard.grid' symbol named '@nsp' "
-             "in the module, but none was found. "
-             "Ensure NSP shard planning/localization ran and created the grid.";
-      signalPassFailure();
-      return;
+    SmallVector<mlir::hexagon::nsp::MaterializeTileOp> worklist;
+    module.walk([&](mlir::hexagon::nsp::MaterializeTileOp op) {
+      worklist.push_back(op);
+    });
+
+    for (mlir::hexagon::nsp::MaterializeTileOp tileOp : worklist) {
+      if (!tileOp || !tileOp->getParentOp())
+        continue;
+
+      auto gridOr = lookupGrid(tileOp, tileOp.getGridAttr());
+      if (failed(gridOr)) {
+        tileOp.emitError()
+            << "NSPMaterialize: could not resolve grid symbol "
+            << tileOp.getGridAttr();
+        signalPassFailure();
+        return;
+      }
+
+      OpBuilder b(tileOp);
+      if (failed(materializeTileToDestination(b, tileOp, *gridOr))) {
+        tileOp.emitError()
+            << "NSPMaterialize: failed to materialize local tile into "
+               "destination";
+        signalPassFailure();
+        return;
+      }
     }
-
-    module.walk([&](mlir::func::FuncOp func) {
-      OpBuilder b(func.getContext());
-
-      SmallVector<linalg::GenericOp> localizedWorklist;
-      func.walk([&](linalg::GenericOp g) {
-        if (g->hasAttr("nsp.localized"))
-          localizedWorklist.push_back(g);
-      });
-
-      DenseMap<int64_t, linalg::GenericOp> originalByGroupId;
-      func.walk([&](linalg::GenericOp g) {
-        if (g->hasAttr("nsp.localized"))
-          return;
-        if (auto id = g->getAttrOfType<IntegerAttr>("nsp.group_id"))
-          originalByGroupId[id.getInt()] = g;
-      });
-
-      for (linalg::GenericOp localizedGeneric : localizedWorklist) {
-        auto groupIdAttr =
-            localizedGeneric->getAttrOfType<IntegerAttr>("nsp.group_id");
-        if (!groupIdAttr) {
-          localizedGeneric.emitError()
-              << "NSPMaterialize: localized op is missing required "
-                 "'nsp.group_id' attribute";
-          signalPassFailure();
-          return;
-        }
-
-        auto it = originalByGroupId.find(groupIdAttr.getInt());
-        if (it == originalByGroupId.end()) {
-          localizedGeneric.emitError()
-              << "NSPMaterialize: could not find matching original global "
-                 "generic for group id "
-              << groupIdAttr.getInt();
-          signalPassFailure();
-          return;
-        }
-
-        linalg::GenericOp originalGeneric = it->second;
-        if (!originalGeneric)
-          continue;
-
-        auto sink = findMaterializeSink(originalGeneric.getResult(0));
-        if (!sink) {
-          originalGeneric.emitError()
-              << "NSPMaterialize: failed to re-discover "
-                 "materialize_in_destination sink for group id "
-              << groupIdAttr.getInt();
-          signalPassFailure();
-          return;
-        }
-
-        auto mat = sink->first;
-        auto &wrappers = sink->second;
-
-        Location loc = localizedGeneric.getLoc();
-        b.setInsertionPoint(mat);
-        Value procIdx = b.create<mlir::shard::ProcessLinearIndexOp>(loc, grid);
-
-        if (failed(materializeTileToDestination(b, localizedGeneric, mat,
-                                                wrappers, originalGeneric,
-                                                procIdx))) {
-          localizedGeneric.emitError()
-              << "NSPMaterialize: failed to materialize local tile into "
-                 "destination";
-          signalPassFailure();
-          return;
-        }
-
-      } // for: localizedWorklist
-    }); // module walk
-  } // runOnOperation
+  }
 };
 
 } // namespace

@@ -1,16 +1,34 @@
-add_mlir_library(MLIRNSP
-  NSPShardInterfaceModels.cpp
-  NSPShardPlanner.cpp
+add_subdirectory(IR)
+
+add_mlir_library(MLIRNSPTransforms
   NSPLocalizePass.cpp
   NSPMaterializePass.cpp
   NSPPasses.cpp
+  NSPShardInterfaceModels.cpp
+  NSPShardPlanner.cpp
+
+  ADDITIONAL_HEADER_DIRS
+    ${PROJECT_SOURCE_DIR}/include/hexagon/NSP
+    ${PROJECT_SOURCE_DIR}/include/hexagon/NSP/IR
+
+  DEPENDS
+    MLIRNSPDialectIncGen
+    MLIRNSPOpsIncGen
 
   LINK_LIBS PUBLIC
-    MLIRIR
-    MLIRPass
-    MLIRFuncDialect
-    MLIRMemRefDialect
+    MLIRArithDialect
     MLIRBufferizationDialect
+    MLIRFuncDialect
+    MLIRIR
+    MLIRLinalgDialect
+    MLIRLinalgTransforms
+    MLIRMemRefDialect
+    MLIRNSP
+    MLIRPass
+    MLIRSCFDialect
     MLIRShardDialect
-    MLIRSupport
+    MLIRShardTransforms
+    MLIRTensorDialect
+    MLIRTransformUtils
+    MLIRTransforms
 )
